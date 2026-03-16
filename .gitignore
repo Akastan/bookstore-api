@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+bookstore.db
+bookstore.db-wal
+bookstore.db-shm
+.coverage
+coverage.json
+htmlcov/
+*.egg-info/
+.pytest_cache/

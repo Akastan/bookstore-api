@@ -1,0 +1,70 @@
+from sqlalchemy import (
+    Column, Integer, String, Float, Text,
+    ForeignKey, CheckConstraint, DateTime
+)
+from sqlalchemy.orm import relationship
+from datetime import datetime, timezone
+
+from .database import Base
+
+
+class Author(Base):
+    __tablename__ = "authors"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    bio = Column(Text, nullable=True)
+    born_year = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    books = relationship("Book", back_populates="author")
+
+
+class Category(Base):
+    __tablename__ = "categories"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(50), nullable=False, unique=True)
+    description = Column(Text, nullable=True)
+
+    books = relationship("Book", back_populates="category")
+
+
+class Book(Base):
+    __tablename__ = "books"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(200), nullable=False)
+    isbn = Column(String(13), nullable=False, unique=True)
+    price = Column(Float, nullable=False)
+    published_year = Column(Integer, nullable=False)
+    stock = Column(Integer, nullable=False, default=0)
+    author_id = Column(Integer, ForeignKey("authors.id"), nullable=False)
+    category_id = Column(Integer, ForeignKey("categories.id"), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        CheckConstraint("price >= 0", name="check_price_positive"),
+        CheckConstraint("stock >= 0", name="check_stock_positive"),
+    )
+
+    author = relationship("Author", back_populates="books")
+    category = relationship("Category", back_populates="books")
+    reviews = relationship("Review", back_populates="book", cascade="all, delete-orphan")
+
+
+class Review(Base):
+    __tablename__ = "reviews"
+
+    id = Column(Integer, primary_key=True, index=True)
+    book_id = Column(Integer, ForeignKey("books.id"), nullable=False)
+    rating = Column(Integer, nullable=False)
+    comment = Column(Text, nullable=True)
+    reviewer_name = Column(String(100), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        CheckConstraint("rating >= 1 AND rating <= 5", name="check_rating_range"),
+    )
+
+    book = relationship("Book", back_populates="reviews")
