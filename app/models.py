@@ -1,7 +1,3 @@
-from sqlalchemy import (
-    Column, Integer, String, Float, Text,
-    ForeignKey, CheckConstraint, DateTime
-)
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
 
