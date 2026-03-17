@@ -3,7 +3,6 @@ Export vstupních dat pro vibe-testing-framework.
 Spusť po startu serveru: python export_inputs.py
 """
 import os
-import json
 import shutil
 import requests
 import yaml
@@ -32,8 +31,13 @@ def export_documentation():
 
 
 def export_source_code():
-    """L2: Spojí zdrojový kód endpointů do jednoho souboru."""
-    files = ["app/main.py", "app/crud.py", "app/schemas.py"]
+    """L2: Spojí zdrojový kód aplikace do jednoho souboru."""
+    files = [
+        "app/main.py",
+        "app/crud.py",
+        "app/schemas.py",
+        "app/models.py",
+    ]
     dst = os.path.join(FRAMEWORK_INPUTS, "source_code.py")
     with open(dst, "w", encoding="utf-8") as out:
         for fpath in files:
@@ -41,7 +45,7 @@ def export_source_code():
             with open(fpath, "r", encoding="utf-8") as f:
                 out.write(f.read())
             out.write("\n")
-    print(f"✅ Zdrojový kód → {dst}")
+    print(f"✅ Zdrojový kód ({len(files)} souborů) → {dst}")
 
 
 def export_db_schema():

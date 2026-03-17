@@ -49,6 +49,29 @@ class CategoryResponse(BaseModel):
         from_attributes = True
 
 
+# ── Tags (před Books kvůli referenci v BookResponse) ─────
+
+class TagCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=30)
+
+
+class TagUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=30)
+
+
+class TagResponse(BaseModel):
+    id: int
+    name: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class BookTagAction(BaseModel):
+    tag_ids: List[int] = Field(..., min_length=1)
+
+
 # ── Books ────────────────────────────────────────────────
 
 class BookCreate(BaseModel):
@@ -83,6 +106,7 @@ class BookResponse(BaseModel):
     created_at: datetime
     author: AuthorResponse
     category: CategoryResponse
+    tags: List[TagResponse] = Field(default_factory=list)
 
     class Config:
         from_attributes = True
@@ -140,6 +164,67 @@ class DiscountResponse(BaseModel):
 
 class PaginatedBooks(BaseModel):
     items: List[BookListResponse]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+# ── Orders ───────────────────────────────────────────────
+
+class OrderItemCreate(BaseModel):
+    book_id: int
+    quantity: int = Field(..., ge=1)
+
+
+class OrderItemResponse(BaseModel):
+    id: int
+    book_id: int
+    quantity: int
+    unit_price: float
+
+    class Config:
+        from_attributes = True
+
+
+class OrderCreate(BaseModel):
+    customer_name: str = Field(..., min_length=1, max_length=100)
+    customer_email: str = Field(..., min_length=1, max_length=200)
+    items: List[OrderItemCreate] = Field(..., min_length=1)
+
+
+class OrderStatusUpdate(BaseModel):
+    status: str = Field(..., pattern="^(confirmed|shipped|delivered|cancelled)$")
+
+
+class OrderResponse(BaseModel):
+    id: int
+    customer_name: str
+    customer_email: str
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    items: List[OrderItemResponse]
+    total_price: float
+
+    class Config:
+        from_attributes = True
+
+
+class OrderListResponse(BaseModel):
+    id: int
+    customer_name: str
+    customer_email: str
+    status: str
+    total_price: float
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedOrders(BaseModel):
+    items: List[OrderListResponse]
     total: int
     page: int
     page_size: int

@@ -12,8 +12,8 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="Bookstore API",
-    description="REST API pro správu knihkupectví – knihy, autoři, kategorie a recenze.",
-    version="1.0.0",
+    description="REST API pro správu knihkupectví – knihy, autoři, kategorie, recenze, tagy a objednávky.",
+    version="2.0.0",
 )
 
 
@@ -148,13 +148,101 @@ def apply_discount(book_id: int, discount: schemas.DiscountRequest, db: Session 
 def update_stock(book_id: int, quantity: int = Query(...), db: Session = Depends(get_db)):
     return crud.update_stock(db, book_id, quantity)
 
+
+# ── Tags ─────────────────────────────────────────────────
+
+@app.post("/tags", response_model=schemas.TagResponse, status_code=201, tags=["Tags"])
+def create_tag(tag: schemas.TagCreate, db: Session = Depends(get_db)):
+    return crud.create_tag(db, tag)
+
+
+@app.get("/tags", response_model=List[schemas.TagResponse], tags=["Tags"])
+def list_tags(db: Session = Depends(get_db)):
+    return crud.get_tags(db)
+
+
+@app.get("/tags/{tag_id}", response_model=schemas.TagResponse, tags=["Tags"])
+def get_tag(tag_id: int, db: Session = Depends(get_db)):
+    return crud.get_tag(db, tag_id)
+
+
+@app.put("/tags/{tag_id}", response_model=schemas.TagResponse, tags=["Tags"])
+def update_tag(tag_id: int, tag: schemas.TagUpdate, db: Session = Depends(get_db)):
+    return crud.update_tag(db, tag_id, tag)
+
+
+@app.delete("/tags/{tag_id}", status_code=204, tags=["Tags"])
+def delete_tag(tag_id: int, db: Session = Depends(get_db)):
+    crud.delete_tag(db, tag_id)
+
+
+@app.post("/books/{book_id}/tags", response_model=schemas.BookResponse, tags=["Tags"])
+def add_tags_to_book(book_id: int, action: schemas.BookTagAction, db: Session = Depends(get_db)):
+    """Přidá tagy ke knize. Již existující vazby se ignorují."""
+    return crud.add_tags_to_book(db, book_id, action.tag_ids)
+
+
+@app.delete("/books/{book_id}/tags", response_model=schemas.BookResponse, tags=["Tags"])
+def remove_tags_from_book(book_id: int, action: schemas.BookTagAction, db: Session = Depends(get_db)):
+    """Odebere tagy z knihy."""
+    return crud.remove_tags_from_book(db, book_id, action.tag_ids)
+
+
+# ── Orders ───────────────────────────────────────────────
+
+@app.post("/orders", response_model=schemas.OrderResponse, status_code=201, tags=["Orders"])
+def create_order(order: schemas.OrderCreate, db: Session = Depends(get_db)):
+    """Vytvoří objednávku, odečte sklad a zachytí aktuální ceny."""
+    o = crud.create_order(db, order)
+    return crud.get_order_response(o)
+
+
+@app.get("/orders", response_model=schemas.PaginatedOrders, tags=["Orders"])
+def list_orders(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    status: Optional[str] = None,
+    customer_name: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    return crud.get_orders(db, page=page, page_size=page_size,
+                           status=status, customer_name=customer_name)
+
+
+@app.get("/orders/{order_id}", response_model=schemas.OrderResponse, tags=["Orders"])
+def get_order(order_id: int, db: Session = Depends(get_db)):
+    o = crud.get_order(db, order_id)
+    return crud.get_order_response(o)
+
+
+@app.patch("/orders/{order_id}/status", response_model=schemas.OrderResponse, tags=["Orders"])
+def update_order_status(
+    order_id: int,
+    status_update: schemas.OrderStatusUpdate,
+    db: Session = Depends(get_db),
+):
+    """Změní stav objednávky dle povolených přechodů. Při zrušení vrátí sklad."""
+    o = crud.update_order_status(db, order_id, status_update.status)
+    return crud.get_order_response(o)
+
+
+@app.delete("/orders/{order_id}", status_code=204, tags=["Orders"])
+def delete_order(order_id: int, db: Session = Depends(get_db)):
+    """Smaže objednávku. Lze smazat pouze pending nebo cancelled objednávky."""
+    crud.delete_order(db, order_id)
+
+
 # ── Reset (pro testovací framework) ──────────────────────
 
 @app.post("/reset", tags=["Testing"])
 def reset_database(db: Session = Depends(get_db)):
     """Smaže všechna data z databáze. Pouze pro testovací účely."""
     db.execute(models.Review.__table__.delete())
+    db.execute(models.OrderItem.__table__.delete())
+    db.execute(models.Order.__table__.delete())
+    db.execute(models.book_tags.delete())
     db.execute(models.Book.__table__.delete())
+    db.execute(models.Tag.__table__.delete())
     db.execute(models.Category.__table__.delete())
     db.execute(models.Author.__table__.delete())
     db.commit()
