@@ -23,8 +23,37 @@ CRUD aplikace postavená na FastAPI + SQLite, která spravuje:
 - **SQLite** – databáze (WAL mode pro souběžný přístup)
 - **Pydantic v2** – validace dat
 - **pytest + requests** – integrační testy
+- **Docker** – kontejnerizace pro izolované spouštění
 
 ## Spuštění
+
+### Varianta 1: Docker (doporučeno)
+
+Docker zajistí izolované prostředí s čistou databází při každém startu. Testovací framework (`vibe-testing-framework`) umí Docker kontejner spouštět a zastavovat automaticky.
+
+```bash
+# Klonování
+git clone https://github.com/Akastan/bookstore-api.git
+cd bookstore-api
+
+# Sestavení a spuštění
+docker compose up --build
+
+# Nebo na pozadí (detached mode)
+docker compose up --build -d
+```
+
+API běží na `http://localhost:8000`. Při každém `docker compose down` + `docker compose up` se vytvoří čistá databáze.
+
+```bash
+# Zastavení a smazání kontejneru (včetně databáze)
+docker compose down
+
+# Zastavení s odstraněním volumes (úplně čistý stav)
+docker compose down --volumes
+```
+
+### Varianta 2: Lokální spuštění
 
 ```bash
 # Klonování
@@ -58,13 +87,14 @@ API běží na `http://localhost:8000`. Interaktivní dokumentace: `http://local
 
 ## Spuštění testů
 
-Testy jsou integrační – volají HTTP endpointy běžícího serveru. Server musí běžet na `localhost:8000`.
+Testy jsou integrační – volají HTTP endpointy běžícího serveru. Server musí běžet na `localhost:8000` (buď přes Docker, nebo lokálně).
 
 ```bash
-# 1. V jednom terminálu spustit server
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+# 1. Spustit server (Docker nebo lokálně)
+docker compose up -d
+# nebo: python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
-# 2. V druhém terminálu resetovat DB a spustit testy
+# 2. Resetovat DB a spustit testy
 curl -X POST http://localhost:8000/reset
 pytest tests/test_existing.py -v
 ```
@@ -92,6 +122,8 @@ bookstore-api/
 │   └── documentation.md # Byznys dokumentace
 ├── tests/
 │   └── test_existing.py # Integrační testy
+├── Dockerfile           # Docker image definice
+├── docker-compose.yml   # Docker Compose konfigurace
 ├── db_schema.sql        # SQL schéma pro export
 ├── export_inputs.py     # Export dat pro vibe-testing-framework
 ├── requirements.txt
@@ -164,7 +196,13 @@ bookstore-api/
 
 ## Použití s Vibe Testing Framework
 
-Toto API slouží jako testovací subjekt. Export vstupních dat pro framework:
+Toto API slouží jako testovací subjekt. Testovací framework umí API spouštět automaticky ve dvou režimech:
+
+**Docker režim** (`docker: true` v `experiment.yaml`): Framework spustí `docker compose up --build -d`, testuje přes HTTP, a po dokončení zavolá `docker compose down --volumes`. Každý run začíná s čistou databází.
+
+**Lokální režim** (výchozí): Framework spustí Python subprocess z `.venv` projektu. Databáze se čistí voláním `POST /reset`.
+
+Export vstupních dat pro framework:
 
 ```bash
 # Server musí běžet
