@@ -1,0 +1,9 @@
+services:
+  bookstore-api:
+    build: .
+    ports:
+      - "8000:8000"
+    # Každý restart = čistá databáze (SQLite se vytvoří znovu)
+    # Pokud chceš persistentní data mezi restarty, odkomentuj:
+    # volumes:
+    #   - ./data:/app/data
