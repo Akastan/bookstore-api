@@ -1,6 +1,6 @@
 # Bookstore API – Technická dokumentace
 
-> **Verze:** 3.0.1 · **Poslední aktualizace:** 2026-03-28 · **Autor:** Bc. Martin Chuděj  
+> **Verze:** 3.0.1 · **Poslední aktualizace:** 2026-04-03 · **Autor:** Bc. Martin Chuděj  
 > **Stack:** Python 3.12 · FastAPI · SQLAlchemy · SQLite (WAL) · Pydantic v2  
 > **Base URL:** `http://localhost:8000` · **Docs:** `http://localhost:8000/docs`
 
