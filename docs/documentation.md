@@ -1,6 +1,6 @@
 # Bookstore API – Technická dokumentace
 
-> **Verze:** 3.0.0 · **Poslední aktualizace:** 2026-03-28 · **Autor:** Bc. Martin Chuděj  
+> **Verze:** 3.0.1 · **Poslední aktualizace:** 2026-03-28 · **Autor:** Bc. Martin Chuděj  
 > **Stack:** Python 3.12 · FastAPI · SQLAlchemy · SQLite (WAL) · Pydantic v2  
 > **Base URL:** `http://localhost:8000` · **Docs:** `http://localhost:8000/docs`
 
@@ -15,7 +15,7 @@ Aplikace běží jako single-instance s SQLite databází. Pro souběžný pří
 ### Entity a relace
 
 ```
-Author (1) ──→ (N) Book (N) ←── (1) Category
+Author (1) ──-> (N) Book (N) ←── (1) Category
                      │
           ┌──────────┼──────────┐
           ↓          ↓          ↓
@@ -181,20 +181,20 @@ Odpověď: `{ "items": [...], "total": N, "page": P, "page_size": S, "total_page
 **Stavový automat:**
 
 ```
-pending ──→ confirmed ──→ shipped ──→ delivered (terminální)
+pending ──-> confirmed ──-> shipped ──-> delivered (terminální)
    │             │
-   └──→ cancelled ←──┘                cancelled (terminální)
+   └──-> cancelled ←──┘                cancelled (terminální)
 ```
 
 Povolené přechody:
 
-| Z | Na |
-|---|-----|
-| `pending` | `confirmed`, `cancelled` |
-| `confirmed` | `shipped`, `cancelled` |
-| `shipped` | `delivered` |
-| `delivered` | *(žádné — terminální stav)* |
-| `cancelled` | *(žádné — terminální stav)* |
+| Z | Na                          |
+|---|-----------------------------|
+| `pending` | `confirmed`, `cancelled`    |
+| `confirmed` | `shipped`, `cancelled`      |
+| `shipped` | `delivered`                 |
+| `delivered` | *(žádné - terminální stav)* |
+| `cancelled` | *(žádné - terminální stav)* |
 
 - Nepovolený přechod -> **400 Bad Request**.
 - **Při zrušení (`cancelled`)** se automaticky **vrátí sklad** - množství z každé položky se přičte zpět.
@@ -216,7 +216,7 @@ Povolené přechody:
 
 ---
 
-## 3. Chybové kódy — přehled
+## 3. Chybové kódy - přehled
 
 | Kód | Kdy se vrací                                                                                                                    |
 |-----|---------------------------------------------------------------------------------------------------------------------------------|
@@ -228,7 +228,106 @@ Povolené přechody:
 | **409** | Konflikt: duplicitní ISBN / název kategorie / název tagu, nebo pokus o smazání entity s vazbami                                 |
 | **422** | Nevalidní vstupní data (chybějící pole, špatný typ, hodnota mimo rozsah) - Pydantic validace                                    |
 
-**Důležitý rozdíl 404 vs. 422:** Pokud je `author_id` správného typu (integer) ale neexistuje v databázi, API vrátí **404** (business validace). Pokud `author_id` chybí nebo je špatného typu, vrátí **422** (schema validace).
+**Důležitý rozdíl 404 vs 422:** Pokud je `author_id` správného typu (integer) ale neexistuje v databázi, API vrátí **404** (business validace). Pokud `author_id` chybí nebo je špatného typu, vrátí **422** (schema validace).
+
+---
+
+### 2.9 Hromadné operace (`/books/bulk`)
+
+| Metoda | Endpoint | Status | Popis |
+|--------|----------|--------|-------|
+| POST | `/books/bulk` | 201 / **207** / 422 | Hromadné vytvoření knih |
+
+**Pravidla:**
+- Body: `{"books": [{ BookCreate }, ...]}`, max 20 knih v jednom requestu.
+- Každá kniha se validuje samostatně - úspěšné se uloží, neúspěšné vrátí chybu.
+- **201** - všechny knihy vytvořeny úspěšně.
+- **207 Multi-Status** - některé vytvořeny, některé selhaly (partial success).
+- **422** - všechny selhaly.
+- Odpověď: `{ "total", "created", "failed", "results": [{ "index", "status", "book"|"error" }] }`
+
+### 2.10 Klonování knihy (`/books/{id}/clone`)
+
+| Metoda | Endpoint | Status | Popis |
+|--------|----------|--------|-------|
+| POST | `/books/{id}/clone` | 201 | Vytvoření kopie knihy |
+
+**Pravidla:**
+- Body: `{"new_isbn": "...", "new_title": "..." (volitelné), "stock": 0}`
+- Zkopíruje cenu, rok vydání, autora, kategorii ze zdrojové knihy.
+- **Stock se nekopíruje** - vždy se nastaví z requestu (default 0).
+- Tagy a recenze se nekopírují.
+- Duplicitní `new_isbn` -> **409 Conflict**.
+- Neexistující zdrojová kniha -> **404**.
+- Pokud `new_title` není zadán, použije se `"{original_title} (copy)"`.
+
+### 2.11 Knihy autora (`/authors/{id}/books`)
+
+| Metoda | Endpoint | Status | Popis |
+|--------|----------|--------|-------|
+| GET | `/authors/{id}/books` | 200 | Stránkovaný seznam knih autora |
+
+- Stránkování: `page`, `page_size` (stejné jako `/books`).
+- Neexistující autor -> **404**.
+- Odpověď: standardní `PaginatedBooks`.
+
+### 2.12 Faktura objednávky (`/orders/{id}/invoice`)
+
+| Metoda | Endpoint | Status | Popis |
+|--------|----------|--------|-------|
+| GET | `/orders/{id}/invoice` | 200 | Vygenerování faktury |
+
+**Pravidla:**
+- Faktura je dostupná **pouze pro objednávky ve stavu `confirmed`, `shipped` nebo `delivered`**.
+- Objednávka ve stavu `pending` nebo `cancelled` -> **403 Forbidden** (ne 400 - klient nemá oprávnění k této operaci v daném stavu).
+- Neexistující objednávka -> **404**.
+- Odpověď: `{ "invoice_number": "INV-000001", "order_id", "customer_name", "customer_email", "status", "issued_at", "items": [{ "book_title", "isbn", "quantity", "unit_price", "line_total" }], "subtotal", "item_count" }`
+
+### 2.13 Přidání položky do objednávky (`/orders/{id}/items`)
+
+| Metoda | Endpoint | Status | Popis |
+|--------|----------|--------|-------|
+| POST | `/orders/{id}/items` | 201 | Přidání knihy do objednávky |
+
+**Pravidla:**
+- Body: `{"book_id": int, "quantity": int >= 1}`
+- Pouze **pending** objednávky lze modifikovat. Jiný stav -> **403 Forbidden**.
+- Kniha, která už je v objednávce -> **409 Conflict** (duplicitní book_id).
+- Neexistující kniha -> **404**.
+- Nedostatečný sklad -> **400 Bad Request**.
+- Při úspěchu se odečte sklad a aktualizuje `updated_at`.
+- Odpověď: kompletní `OrderResponse` s aktualizovanými položkami a `total_price`.
+
+### 2.14 Statistiky (`/statistics/summary`)
+
+| Metoda | Endpoint | Status | Popis |
+|--------|----------|--------|-------|
+| GET | `/statistics/summary` | 200 | Souhrnné statistiky |
+
+- Odpověď: `{ "total_authors", "total_categories", "total_books", "total_tags", "total_orders", "total_reviews", "books_in_stock", "books_out_of_stock", "total_revenue", "average_book_price", "average_rating", "orders_by_status": {"pending": N, ...} }`
+- `total_revenue` se počítá **pouze z delivered objednávek**.
+- `average_book_price` a `average_rating` jsou `null` pokud nejsou žádné knihy/recenze.
+
+---
+
+## 3. Chybové kódy - přehled
+
+| Kód | Kdy se vrací                                                                                                                      |
+|-----|-----------------------------------------------------------------------------------------------------------------------------------|
+| **200** | Úspěšný GET, PUT, PATCH                                                                                                           |
+| **201** | Úspěšné vytvoření (POST), přidání položky do objednávky                                                                           |
+| **204** | Úspěšné smazání (DELETE) - prázdné tělo, žádný JSON                                                                               |
+| **207** | **Multi-Status** - hromadné operace s částečným úspěchem (`/books/bulk`)                                                          |
+| **400** | Porušení byznys pravidla: nedostatečný sklad, nepovolený stavový přechod, duplicitní book_id v objednávce, sleva na novou knihu   |
+| **403** | **Forbidden** - operace nedostupná v aktuálním stavu: faktura pro pending/cancelled objednávku, modifikace non-pending objednávky |
+| **404** | Entita nenalezena                                                                                                                 |
+| **409** | Konflikt: duplicitní ISBN / název, pokus o smazání entity s vazbami, duplicitní kniha v objednávce                                |
+| **422** | Nevalidní vstupní data (Pydantic validace)                                                                                        |
+
+**Důležité rozdíly:**
+- **400 vs 403:** 400 = porušení byznys pravidla (špatný vstup). 403 = operace není v daném kontextu povolena (stavová prerekvizita).
+- **404 vs 422:** Pokud je `author_id` správného typu ale neexistuje -> **404**. Pokud chybí nebo je špatného typu -> **422**.
+- **207 vs 201 vs 422:** Bulk endpoint vrací 201 (vše OK), 207 (mix), 422 (vše selhalo).
 
 ---
 
@@ -249,12 +348,21 @@ Povolené přechody:
 ### 4.3 Side effects
 
 - **POST `/orders`** - odečítá sklad (book.stock -= quantity)
+- **POST `/orders/{id}/items`** - odečítá sklad pro nově přidanou položku
 - **PATCH `/orders/{id}/status`** -> `cancelled` - vrací sklad zpět
 - **DELETE `/orders/{id}`** (pending) - vrací sklad zpět
 - **DELETE `/orders/{id}`** (cancelled) - sklad NEvrací (byl vrácen při zrušení)
 - **DELETE `/books/{id}`** - kaskádově maže recenze a vazby na tagy
+- **POST `/books/{id}/clone`** - vytvoří novou knihu, stock se nekopíruje (vždy z requestu)
+- **POST `/books/bulk`** - při partial success (207) se uloží jen úspěšné knihy
 
-### 4.4 Known Issues
+### 4.4 Stavové prerekvizity (403 Forbidden)
+
+Některé operace vyžadují specifický stav objednávky:
+- `GET /orders/{id}/invoice` - vyžaduje `confirmed`, `shipped` nebo `delivered`. Pending/cancelled -> 403.
+- `POST /orders/{id}/items` - vyžaduje `pending`. Jakýkoli jiný stav -> 403.
+
+### 4.5 Known Issues
 
 - Stránkování vrací `total_pages: 1` i pro prázdnou databázi (místo 0).
 - `author_id=0` ve filtru knih vrací prázdný výsledek místo chyby.
