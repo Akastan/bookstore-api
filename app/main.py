@@ -7,6 +7,8 @@ from .database import engine, get_db, Base
 from . import crud, schemas
 from . import models
 
+from fastapi.responses import JSONResponse
+
 # Vytvoření tabulek při startu
 Base.metadata.create_all(bind=engine)
 
@@ -247,3 +249,89 @@ def reset_database(db: Session = Depends(get_db)):
     db.execute(models.Author.__table__.delete())
     db.commit()
     return {"status": "ok", "message": "Database reset complete"}
+
+
+# ── Author's Books ───────────────────────────────────────
+
+@app.get("/authors/{author_id}/books", response_model=schemas.PaginatedBooks,
+         tags=["Authors"])
+def list_author_books(
+    author_id: int,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """Seznam knih daného autora s stránkováním."""
+    return crud.get_author_books(db, author_id, page=page, page_size=page_size)
+
+
+# ── Bulk Create Books ────────────────────────────────────
+
+@app.post("/books/bulk", tags=["Books"])
+def bulk_create_books(
+    data: schemas.BulkBookCreate, db: Session = Depends(get_db),
+):
+    """
+    Hromadné vytvoření knih. Každá kniha se validuje samostatně.
+    Vrací 201 pokud všechny uspěly, 207 pokud některé selhaly,
+    422 pokud všechny selhaly.
+    """
+    result = crud.bulk_create_books(db, data)
+
+    if result.failed == 0:
+        return JSONResponse(status_code=201, content=result.model_dump())
+    elif result.created == 0:
+        return JSONResponse(status_code=422, content=result.model_dump())
+    else:
+        return JSONResponse(status_code=207, content=result.model_dump())
+
+
+# ── Clone Book ───────────────────────────────────────────
+
+@app.post("/books/{book_id}/clone", response_model=schemas.BookResponse,
+          status_code=201, tags=["Books"])
+def clone_book(
+    book_id: int, data: schemas.BookCloneRequest,
+    db: Session = Depends(get_db),
+):
+    """Vytvoří kopii knihy s novým ISBN. Stock se nekopíruje."""
+    return crud.clone_book(db, book_id, data)
+
+
+# ── Invoice ──────────────────────────────────────────────
+
+@app.get("/orders/{order_id}/invoice", response_model=schemas.InvoiceResponse,
+         tags=["Orders"])
+def get_invoice(order_id: int, db: Session = Depends(get_db)):
+    """
+    Vygeneruje fakturu pro objednávku.
+    Dostupné pouze pro objednávky ve stavu confirmed, shipped nebo delivered.
+    Pending a cancelled → 403.
+    """
+    return crud.generate_invoice(db, order_id)
+
+
+# ── Add Item to Order ────────────────────────────────────
+
+@app.post("/orders/{order_id}/items", response_model=schemas.OrderResponse,
+          status_code=201, tags=["Orders"])
+def add_item_to_order(
+    order_id: int, data: schemas.OrderAddItem,
+    db: Session = Depends(get_db),
+):
+    """
+    Přidá položku do existující objednávky.
+    Pouze pending objednávky lze modifikovat (jinak 403).
+    Duplicitní book_id v objednávce → 409.
+    """
+    order = crud.add_item_to_order(db, order_id, data)
+    return crud.get_order_response(order)
+
+
+# ── Statistics ───────────────────────────────────────────
+
+@app.get("/statistics/summary", response_model=schemas.StatisticsSummary,
+         tags=["Statistics"])
+def get_statistics(db: Session = Depends(get_db)):
+    """Souhrnné statistiky knihkupectví. Obrat se počítá jen z delivered objednávek."""
+    return crud.get_statistics(db)

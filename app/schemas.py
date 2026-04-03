@@ -229,3 +229,87 @@ class PaginatedOrders(BaseModel):
     page: int
     page_size: int
     total_pages: int
+
+
+# ── Bulk Create ──────────────────────────────────────────
+
+class BulkBookItem(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    isbn: str = Field(..., min_length=10, max_length=13)
+    price: float = Field(..., ge=0)
+    published_year: int = Field(..., ge=1000, le=2026)
+    stock: int = Field(0, ge=0)
+    author_id: int
+    category_id: int
+
+
+class BulkBookCreate(BaseModel):
+    books: List[BulkBookItem] = Field(..., min_length=1, max_length=20)
+
+
+class BulkResultItem(BaseModel):
+    index: int
+    status: str  # "created" | "error"
+    book: Optional[BookResponse] = None
+    error: Optional[str] = None
+
+
+class BulkCreateResponse(BaseModel):
+    total: int
+    created: int
+    failed: int
+    results: List[BulkResultItem]
+
+
+# ── Clone ────────────────────────────────────────────────
+
+class BookCloneRequest(BaseModel):
+    new_isbn: str = Field(..., min_length=10, max_length=13)
+    new_title: Optional[str] = None
+    stock: int = Field(0, ge=0)
+
+
+# ── Invoice ──────────────────────────────────────────────
+
+class InvoiceItem(BaseModel):
+    book_title: str
+    isbn: str
+    quantity: int
+    unit_price: float
+    line_total: float
+
+
+class InvoiceResponse(BaseModel):
+    invoice_number: str
+    order_id: int
+    customer_name: str
+    customer_email: str
+    status: str
+    issued_at: str
+    items: List[InvoiceItem]
+    subtotal: float
+    item_count: int
+
+
+# ── Add Item to Order ────────────────────────────────────
+
+class OrderAddItem(BaseModel):
+    book_id: int
+    quantity: int = Field(..., ge=1)
+
+
+# ── Statistics ───────────────────────────────────────────
+
+class StatisticsSummary(BaseModel):
+    total_authors: int
+    total_categories: int
+    total_books: int
+    total_tags: int
+    total_orders: int
+    total_reviews: int
+    books_in_stock: int
+    books_out_of_stock: int
+    total_revenue: float
+    average_book_price: Optional[float]
+    average_rating: Optional[float]
+    orders_by_status: dict

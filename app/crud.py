@@ -465,3 +465,250 @@ def get_order_response(order: models.Order) -> dict:
         "items": order.items,
         "total_price": round(total_price, 2),
     }
+
+
+# ── Author's Books ───────────────────────────────────────
+
+def get_author_books(db: Session, author_id: int, page: int = 1, page_size: int = 10):
+    get_author(db, author_id)  # 404 pokud neexistuje
+    q = db.query(models.Book).filter(models.Book.author_id == author_id)
+    total = q.count()
+    total_pages = math.ceil(total / page_size) if total > 0 else 1
+    items = q.offset((page - 1) * page_size).limit(page_size).all()
+    return schemas.PaginatedBooks(
+        items=items, total=total, page=page,
+        page_size=page_size, total_pages=total_pages,
+    )
+
+
+# ── Bulk Create Books ────────────────────────────────────
+
+def bulk_create_books(db: Session, data: schemas.BulkBookCreate) -> schemas.BulkCreateResponse:
+    """
+    Vytvoří knihy hromadně. Každá se validuje samostatně.
+    Úspěšné se commitnou, neúspěšné vrátí chybu.
+    Vrací 207 pokud je mix úspěchů a chyb, 201 pokud vše OK, 422 pokud vše selže.
+    """
+    results = []
+    created_count = 0
+    failed_count = 0
+
+    for i, book_data in enumerate(data.books):
+        try:
+            # Validace autora
+            author = db.query(models.Author).filter(
+                models.Author.id == book_data.author_id
+            ).first()
+            if not author:
+                raise ValueError(f"Author with id {book_data.author_id} not found")
+
+            # Validace kategorie
+            cat = db.query(models.Category).filter(
+                models.Category.id == book_data.category_id
+            ).first()
+            if not cat:
+                raise ValueError(f"Category with id {book_data.category_id} not found")
+
+            # Validace ISBN unikátnosti
+            if db.query(models.Book).filter(
+                models.Book.isbn == book_data.isbn
+            ).first():
+                raise ValueError(f"Book with ISBN '{book_data.isbn}' already exists")
+
+            # Vytvoření
+            book = models.Book(**book_data.model_dump())
+            db.add(book)
+            db.flush()  # získáme ID bez commitu
+            db.refresh(book)
+
+            results.append(schemas.BulkResultItem(
+                index=i, status="created", book=book,
+            ))
+            created_count += 1
+
+        except (ValueError, Exception) as e:
+            results.append(schemas.BulkResultItem(
+                index=i, status="error", error=str(e),
+            ))
+            failed_count += 1
+
+    if created_count > 0:
+        db.commit()  # commit jen úspěšné
+    else:
+        db.rollback()
+
+    return schemas.BulkCreateResponse(
+        total=len(data.books),
+        created=created_count,
+        failed=failed_count,
+        results=results,
+    )
+
+
+# ── Clone Book ───────────────────────────────────────────
+
+def clone_book(db: Session, book_id: int, data: schemas.BookCloneRequest) -> models.Book:
+    source = get_book(db, book_id)  # 404 pokud neexistuje
+
+    # ISBN unikátnost
+    if db.query(models.Book).filter(models.Book.isbn == data.new_isbn).first():
+        raise HTTPException(
+            status_code=409,
+            detail=f"Book with ISBN '{data.new_isbn}' already exists",
+        )
+
+    clone = models.Book(
+        title=data.new_title or f"{source.title} (copy)",
+        isbn=data.new_isbn,
+        price=source.price,
+        published_year=source.published_year,
+        stock=data.stock,  # stock se NEKOPÍRUJE — explicitně nastavený nebo 0
+        author_id=source.author_id,
+        category_id=source.category_id,
+    )
+    db.add(clone)
+    db.commit()
+    db.refresh(clone)
+    return clone
+
+
+# ── Invoice ──────────────────────────────────────────────
+
+def generate_invoice(db: Session, order_id: int) -> schemas.InvoiceResponse:
+    order = get_order(db, order_id)
+
+    # Faktura jen pro potvrzené+ objednávky
+    if order.status in ("pending", "cancelled"):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Cannot generate invoice for order in '{order.status}' state. "
+                   f"Order must be confirmed, shipped, or delivered.",
+        )
+
+    items = []
+    subtotal = 0.0
+    for oi in order.items:
+        book = db.query(models.Book).filter(models.Book.id == oi.book_id).first()
+        line_total = round(oi.unit_price * oi.quantity, 2)
+        items.append(schemas.InvoiceItem(
+            book_title=book.title if book else "Unknown",
+            isbn=book.isbn if book else "N/A",
+            quantity=oi.quantity,
+            unit_price=oi.unit_price,
+            line_total=line_total,
+        ))
+        subtotal += line_total
+
+    return schemas.InvoiceResponse(
+        invoice_number=f"INV-{order.id:06d}",
+        order_id=order.id,
+        customer_name=order.customer_name,
+        customer_email=order.customer_email,
+        status=order.status,
+        issued_at=datetime.now(timezone.utc).isoformat(),
+        items=items,
+        subtotal=round(subtotal, 2),
+        item_count=len(items),
+    )
+
+
+# ── Add Item to Pending Order ────────────────────────────
+
+def add_item_to_order(
+    db: Session, order_id: int, data: schemas.OrderAddItem,
+) -> models.Order:
+    order = get_order(db, order_id)
+
+    # Jen pending objednávky lze modifikovat
+    if order.status != "pending":
+        raise HTTPException(
+            status_code=403,
+            detail=f"Cannot modify order in '{order.status}' state. "
+                   f"Only pending orders can be modified.",
+        )
+
+    # Kontrola duplicitního book_id
+    existing_book_ids = {oi.book_id for oi in order.items}
+    if data.book_id in existing_book_ids:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Book {data.book_id} is already in this order. "
+                   f"Use a separate order or modify the existing item.",
+        )
+
+    # Validace knihy a skladu
+    book = get_book(db, data.book_id)
+    if book.stock < data.quantity:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient stock for book '{book.title}'. "
+                   f"Available: {book.stock}, requested: {data.quantity}",
+        )
+
+    # Přidání položky + odečtení skladu
+    oi = models.OrderItem(
+        order_id=order.id,
+        book_id=data.book_id,
+        quantity=data.quantity,
+        unit_price=book.price,
+    )
+    db.add(oi)
+    book.stock -= data.quantity
+
+    order.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+# ── Statistics ───────────────────────────────────────────
+
+def get_statistics(db: Session) -> schemas.StatisticsSummary:
+    total_books = db.query(models.Book).count()
+    total_orders = db.query(models.Order).count()
+
+    # Knihy na skladě vs vyprodané
+    in_stock = db.query(models.Book).filter(models.Book.stock > 0).count()
+
+    # Celkový obrat (jen z delivered objednávek)
+    delivered = db.query(models.Order).filter(
+        models.Order.status == "delivered"
+    ).all()
+    revenue = 0.0
+    for order in delivered:
+        revenue += sum(i.unit_price * i.quantity for i in order.items)
+
+    # Průměrná cena knih
+    avg_price = None
+    if total_books > 0:
+        prices = [b.price for b in db.query(models.Book).all()]
+        avg_price = round(sum(prices) / len(prices), 2)
+
+    # Průměrné hodnocení
+    avg_rating = None
+    reviews = db.query(models.Review).all()
+    if reviews:
+        avg_rating = round(sum(r.rating for r in reviews) / len(reviews), 2)
+
+    # Objednávky dle stavu
+    status_counts = {}
+    for status in ["pending", "confirmed", "shipped", "delivered", "cancelled"]:
+        count = db.query(models.Order).filter(
+            models.Order.status == status
+        ).count()
+        status_counts[status] = count
+
+    return schemas.StatisticsSummary(
+        total_authors=db.query(models.Author).count(),
+        total_categories=db.query(models.Category).count(),
+        total_books=total_books,
+        total_tags=db.query(models.Tag).count(),
+        total_orders=total_orders,
+        total_reviews=len(reviews),
+        books_in_stock=in_stock,
+        books_out_of_stock=total_books - in_stock,
+        total_revenue=round(revenue, 2),
+        average_book_price=avg_price,
+        average_rating=avg_rating,
+        orders_by_status=status_counts,
+    )
