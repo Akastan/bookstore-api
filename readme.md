@@ -1,6 +1,6 @@
 # Bookstore API
 
-REST API pro správu knihkupectví. Slouží jako testovací aplikace pro [vibe-testing-framework](https://github.com/Akastan/vibe-testing-framework) — framework pro automatické generování API testů pomocí LLM.
+REST API pro správu knihkupectví. Slouží jako testovací aplikace pro [vibe-testing-framework](https://github.com/Akastan/vibe-testing-framework) - framework pro automatické generování API testů pomocí LLM.
 
 ## O projektu
 
@@ -13,7 +13,7 @@ CRUD aplikace postavená na FastAPI + SQLite se 40 endpointy a 10 různými HTTP
 - **Slevy** – aplikace slev s byznys pravidly (max 50 %, jen starší knihy)
 - **Správa skladu** – delta přičítání/odečítání přes query parametr, ochrana proti zápornému stavu
 - **Tagy** – many-to-many vazba na knihy, idempotentní přidávání, ochrana při mazání
-- **Objednávky** – stavový automat (pending → confirmed → shipped → delivered / cancelled), zachycení cen, automatická správa skladu, přidávání položek, fakturace
+- **Objednávky** – stavový automat (pending -> confirmed -> shipped -> delivered / cancelled), zachycení cen, automatická správa skladu, přidávání položek, fakturace
 - **Statistiky** – agregované metriky (obrat, průměrné hodnocení, stav skladu)
 
 ## Technologie
@@ -135,24 +135,24 @@ pytest tests/test_existing.py -v
 
 ### Status kódy (10)
 
-| Kód | Význam |
-|-----|--------|
-| 200 | Úspěšný GET / PUT / PATCH |
-| 201 | Úspěšné vytvoření |
-| 204 | Úspěšné smazání (prázdné tělo) |
-| 207 | Multi-Status — hromadné operace s partial success |
-| 400 | Porušení byznys pravidla |
-| 403 | Operace nedostupná v aktuálním stavu |
-| 404 | Entita nenalezena |
-| 409 | Konflikt (duplicita, závislosti) |
-| 422 | Nevalidní vstupní data (Pydantic) |
+| Kód | Význam                                            |
+|-----|---------------------------------------------------|
+| 200 | Úspěšný GET / PUT / PATCH                         |
+| 201 | Úspěšné vytvoření                                 |
+| 204 | Úspěšné smazání (prázdné tělo)                    |
+| 207 | Multi-Status - hromadné operace s partial success |
+| 400 | Porušení byznys pravidla                          |
+| 403 | Operace nedostupná v aktuálním stavu              |
+| 404 | Entita nenalezena                                 |
+| 409 | Konflikt (duplicita, závislosti)                  |
+| 422 | Nevalidní vstupní data (Pydantic)                 |
 
 ## Stavový automat objednávek
 
 ```
-pending ──→ confirmed ──→ shipped ──→ delivered (terminální)
+pending ──-> confirmed ──-> shipped ──-> delivered (terminální)
    │             │
-   └──→ cancelled ←──┘                cancelled (terminální)
+   └──-> cancelled ←──┘                cancelled (terminální)
 ```
 
 ## Struktura
@@ -189,4 +189,4 @@ Exportuje OpenAPI spec, dokumentaci, zdrojový kód, DB schéma a existující t
 
 ## Licence
 
-Projekt pro diplomovou práci — testování REST API pomocí LLM.
+Projekt pro diplomovou práci - Vibe Testing: využití vibe codingu pro automatizované generování testů softwaru.
