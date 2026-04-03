@@ -15,7 +15,7 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(
     title="Bookstore API",
     description="REST API pro správu knihkupectví – knihy, autoři, kategorie, recenze, tagy a objednávky.",
-    version="2.0.0",
+    version="3.0.2",
 )
 
 
