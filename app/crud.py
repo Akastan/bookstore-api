@@ -1,4 +1,6 @@
+
 import math
+import hashlib
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
@@ -6,6 +8,12 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from . import models, schemas
+
+
+# ═══ ETag helper ═════════════════════════════════════════
+
+def generate_etag(updated_at) -> str:
+    return hashlib.md5(str(updated_at).encode()).hexdigest()
 
 
 # ═══ Authors ═════════════════════════════════════════════
@@ -33,6 +41,7 @@ def update_author(db: Session, author_id: int, data: schemas.AuthorUpdate):
     author = get_author(db, author_id)
     for k, v in data.model_dump(exclude_unset=True).items():
         setattr(author, k, v)
+    author.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(author)
     return author
@@ -40,7 +49,10 @@ def update_author(db: Session, author_id: int, data: schemas.AuthorUpdate):
 
 def delete_author(db: Session, author_id: int):
     author = get_author(db, author_id)
-    book_count = db.query(models.Book).filter(models.Book.author_id == author_id).count()
+    book_count = db.query(models.Book).filter(
+        models.Book.author_id == author_id,
+        models.Book.is_deleted == False,
+    ).count()
     if book_count > 0:
         raise HTTPException(
             status_code=409,
@@ -85,6 +97,7 @@ def update_category(db: Session, category_id: int, data: schemas.CategoryUpdate)
             raise HTTPException(status_code=409, detail=f"Category '{update['name']}' already exists")
     for k, v in update.items():
         setattr(cat, k, v)
+    cat.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(cat)
     return cat
@@ -92,7 +105,10 @@ def update_category(db: Session, category_id: int, data: schemas.CategoryUpdate)
 
 def delete_category(db: Session, category_id: int):
     cat = get_category(db, category_id)
-    book_count = db.query(models.Book).filter(models.Book.category_id == category_id).count()
+    book_count = db.query(models.Book).filter(
+        models.Book.category_id == category_id,
+        models.Book.is_deleted == False,
+    ).count()
     if book_count > 0:
         raise HTTPException(
             status_code=409,
@@ -103,6 +119,24 @@ def delete_category(db: Session, category_id: int):
 
 
 # ═══ Books ═══════════════════════════════════════════════
+
+def get_book(db: Session, book_id: int) -> models.Book:
+    """Returns 404 if not found, 410 if soft-deleted."""
+    book = db.query(models.Book).filter(models.Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail=f"Book with id {book_id} not found")
+    if book.is_deleted:
+        raise HTTPException(status_code=410, detail=f"Book with id {book_id} has been deleted")
+    return book
+
+
+def get_book_include_deleted(db: Session, book_id: int) -> models.Book:
+    """Internal: returns book regardless of soft-delete status. 404 only."""
+    book = db.query(models.Book).filter(models.Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail=f"Book with id {book_id} not found")
+    return book
+
 
 def create_book(db: Session, data: schemas.BookCreate) -> models.Book:
     get_author(db, data.author_id)
@@ -116,24 +150,17 @@ def create_book(db: Session, data: schemas.BookCreate) -> models.Book:
     return book
 
 
-def get_book(db: Session, book_id: int) -> models.Book:
-    book = db.query(models.Book).filter(models.Book.id == book_id).first()
-    if not book:
-        raise HTTPException(status_code=404, detail=f"Book with id {book_id} not found")
-    return book
-
-
 def get_books(
     db: Session, page: int = 1, page_size: int = 10,
     search: str = None, author_id: int = None,
     category_id: int = None, min_price: float = None,
-    max_price: float = None
+    max_price: float = None,
 ) -> schemas.PaginatedBooks:
-    q = db.query(models.Book)
+    q = db.query(models.Book).filter(models.Book.is_deleted == False)
     if search:
         q = q.filter(or_(
             models.Book.title.ilike(f"%{search}%"),
-            models.Book.isbn.ilike(f"%{search}%")
+            models.Book.isbn.ilike(f"%{search}%"),
         ))
     if author_id:
         q = q.filter(models.Book.author_id == author_id)
@@ -147,10 +174,9 @@ def get_books(
     total = q.count()
     total_pages = math.ceil(total / page_size) if total > 0 else 1
     items = q.offset((page - 1) * page_size).limit(page_size).all()
-
     return schemas.PaginatedBooks(
         items=items, total=total, page=page,
-        page_size=page_size, total_pages=total_pages
+        page_size=page_size, total_pages=total_pages,
     )
 
 
@@ -164,27 +190,44 @@ def update_book(db: Session, book_id: int, data: schemas.BookUpdate):
     if "isbn" in update:
         dup = db.query(models.Book).filter(
             models.Book.isbn == update["isbn"],
-            models.Book.id != book_id
+            models.Book.id != book_id,
         ).first()
         if dup:
             raise HTTPException(status_code=409, detail=f"Book with ISBN '{update['isbn']}' already exists")
     for k, v in update.items():
         setattr(book, k, v)
+    book.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(book)
     return book
 
 
 def delete_book(db: Session, book_id: int):
+    """Soft delete — sets is_deleted=True, preserves reviews and tags."""
     book = get_book(db, book_id)
-    db.delete(book)
+    book.is_deleted = True
+    book.deleted_at = datetime.now(timezone.utc)
+    book.updated_at = datetime.now(timezone.utc)
     db.commit()
+
+
+def restore_book(db: Session, book_id: int) -> models.Book:
+    """Restore a soft-deleted book. 404 if not found, 400 if not deleted."""
+    book = get_book_include_deleted(db, book_id)
+    if not book.is_deleted:
+        raise HTTPException(status_code=400, detail=f"Book with id {book_id} is not deleted")
+    book.is_deleted = False
+    book.deleted_at = None
+    book.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(book)
+    return book
 
 
 # ═══ Reviews ═════════════════════════════════════════════
 
 def create_review(db: Session, book_id: int, data: schemas.ReviewCreate):
-    get_book(db, book_id)
+    get_book(db, book_id)  # 404/410 check
     review = models.Review(book_id=book_id, **data.model_dump())
     db.add(review)
     db.commit()
@@ -206,7 +249,7 @@ def get_book_average_rating(db: Session, book_id: int) -> dict:
     return {"book_id": book_id, "average_rating": round(avg, 2), "review_count": len(reviews)}
 
 
-# ═══ Discount (business logika) ══════════════════════════
+# ═══ Discount ════════════════════════════════════════════
 
 def apply_discount(db: Session, book_id: int, data: schemas.DiscountRequest):
     book = get_book(db, book_id)
@@ -214,18 +257,18 @@ def apply_discount(db: Session, book_id: int, data: schemas.DiscountRequest):
     if current_year - book.published_year < 1:
         raise HTTPException(
             status_code=400,
-            detail="Discount can only be applied to books published more than 1 year ago"
+            detail="Discount can only be applied to books published more than 1 year ago",
         )
     discounted = round(book.price * (1 - data.discount_percent / 100), 2)
     return schemas.DiscountResponse(
         book_id=book.id, title=book.title,
         original_price=book.price,
         discount_percent=data.discount_percent,
-        discounted_price=discounted
+        discounted_price=discounted,
     )
 
 
-# ═══ Stock management ════════════════════════════════════
+# ═══ Stock ═══════════════════════════════════════════════
 
 def update_stock(db: Session, book_id: int, quantity: int):
     book = get_book(db, book_id)
@@ -233,9 +276,10 @@ def update_stock(db: Session, book_id: int, quantity: int):
     if new_stock < 0:
         raise HTTPException(
             status_code=400,
-            detail=f"Insufficient stock. Current: {book.stock}, requested change: {quantity}"
+            detail=f"Insufficient stock. Current: {book.stock}, requested change: {quantity}",
         )
     book.stock = new_stock
+    book.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(book)
     return book
@@ -270,12 +314,13 @@ def update_tag(db: Session, tag_id: int, data: schemas.TagUpdate):
     if "name" in update:
         dup = db.query(models.Tag).filter(
             models.Tag.name == update["name"],
-            models.Tag.id != tag_id
+            models.Tag.id != tag_id,
         ).first()
         if dup:
             raise HTTPException(status_code=409, detail=f"Tag '{update['name']}' already exists")
     for k, v in update.items():
         setattr(tag, k, v)
+    tag.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(tag)
     return tag
@@ -283,11 +328,10 @@ def update_tag(db: Session, tag_id: int, data: schemas.TagUpdate):
 
 def delete_tag(db: Session, tag_id: int):
     tag = get_tag(db, tag_id)
-    book_count = len(tag.books)
-    if book_count > 0:
+    if len(tag.books) > 0:
         raise HTTPException(
             status_code=409,
-            detail=f"Cannot delete tag with {book_count} associated book(s). Remove tag from books first."
+            detail=f"Cannot delete tag with {len(tag.books)} associated book(s). Remove tag from books first.",
         )
     db.delete(tag)
     db.commit()
@@ -327,15 +371,10 @@ VALID_STATUS_TRANSITIONS = {
 
 
 def create_order(db: Session, data: schemas.OrderCreate) -> models.Order:
-    # Validace: kontrola duplicitních book_id v položkách
     book_ids = [item.book_id for item in data.items]
     if len(book_ids) != len(set(book_ids)):
-        raise HTTPException(
-            status_code=400,
-            detail="Duplicate book_id in order items"
-        )
+        raise HTTPException(status_code=400, detail="Duplicate book_id in order items")
 
-    # Validace: kontrola existence knih a dostatku skladu
     order_items = []
     for item in data.items:
         book = get_book(db, item.book_id)
@@ -343,26 +382,22 @@ def create_order(db: Session, data: schemas.OrderCreate) -> models.Order:
             raise HTTPException(
                 status_code=400,
                 detail=f"Insufficient stock for book '{book.title}'. "
-                       f"Available: {book.stock}, requested: {item.quantity}"
+                       f"Available: {book.stock}, requested: {item.quantity}",
             )
         order_items.append((book, item))
 
-    # Vytvoření objednávky
     order = models.Order(
         customer_name=data.customer_name,
         customer_email=data.customer_email,
         status="pending",
     )
     db.add(order)
-    db.flush()  # získáme order.id
+    db.flush()
 
-    # Vytvoření položek a odečtení skladu
     for book, item in order_items:
         oi = models.OrderItem(
-            order_id=order.id,
-            book_id=item.book_id,
-            quantity=item.quantity,
-            unit_price=book.price,  # zachycení ceny v momentě objednávky
+            order_id=order.id, book_id=item.book_id,
+            quantity=item.quantity, unit_price=book.price,
         )
         db.add(oi)
         book.stock -= item.quantity
@@ -402,7 +437,6 @@ def get_orders(
             customer_email=o.customer_email, status=o.status,
             total_price=round(total_price, 2), created_at=o.created_at,
         ))
-
     return schemas.PaginatedOrders(
         items=items, total=total, page=page,
         page_size=page_size, total_pages=total_pages,
@@ -412,21 +446,17 @@ def get_orders(
 def update_order_status(db: Session, order_id: int, new_status: str) -> models.Order:
     order = get_order(db, order_id)
     allowed = VALID_STATUS_TRANSITIONS.get(order.status, [])
-
     if new_status not in allowed:
         raise HTTPException(
             status_code=400,
             detail=f"Cannot transition from '{order.status}' to '{new_status}'. "
-                   f"Allowed transitions: {allowed if allowed else 'none (terminal state)'}"
+                   f"Allowed transitions: {allowed if allowed else 'none (terminal state)'}",
         )
-
-    # Při zrušení objednávky vrátíme sklad
     if new_status == "cancelled":
         for item in order.items:
             book = db.query(models.Book).filter(models.Book.id == item.book_id).first()
             if book:
                 book.stock += item.quantity
-
     order.status = new_status
     order.updated_at = datetime.now(timezone.utc)
     db.commit()
@@ -440,9 +470,8 @@ def delete_order(db: Session, order_id: int):
         raise HTTPException(
             status_code=400,
             detail=f"Cannot delete order in '{order.status}' state. "
-                   f"Only pending or cancelled orders can be deleted."
+                   f"Only pending or cancelled orders can be deleted.",
         )
-    # Pokud je pending, vrátíme sklad
     if order.status == "pending":
         for item in order.items:
             book = db.query(models.Book).filter(models.Book.id == item.book_id).first()
@@ -453,7 +482,6 @@ def delete_order(db: Session, order_id: int):
 
 
 def get_order_response(order: models.Order) -> dict:
-    """Helper pro sestavení odpovědi s total_price."""
     total_price = sum(i.unit_price * i.quantity for i in order.items)
     return {
         "id": order.id,
@@ -470,8 +498,11 @@ def get_order_response(order: models.Order) -> dict:
 # ── Author's Books ───────────────────────────────────────
 
 def get_author_books(db: Session, author_id: int, page: int = 1, page_size: int = 10):
-    get_author(db, author_id)  # 404 pokud neexistuje
-    q = db.query(models.Book).filter(models.Book.author_id == author_id)
+    get_author(db, author_id)
+    q = db.query(models.Book).filter(
+        models.Book.author_id == author_id,
+        models.Book.is_deleted == False,
+    )
     total = q.count()
     total_pages = math.ceil(total / page_size) if total > 0 else 1
     items = q.offset((page - 1) * page_size).limit(page_size).all()
@@ -484,87 +515,53 @@ def get_author_books(db: Session, author_id: int, page: int = 1, page_size: int 
 # ── Bulk Create Books ────────────────────────────────────
 
 def bulk_create_books(db: Session, data: schemas.BulkBookCreate) -> schemas.BulkCreateResponse:
-    """
-    Vytvoří knihy hromadně. Každá se validuje samostatně.
-    Úspěšné se commitnou, neúspěšné vrátí chybu.
-    Vrací 207 pokud je mix úspěchů a chyb, 201 pokud vše OK, 422 pokud vše selže.
-    """
     results = []
     created_count = 0
     failed_count = 0
 
     for i, book_data in enumerate(data.books):
         try:
-            # Validace autora
-            author = db.query(models.Author).filter(
-                models.Author.id == book_data.author_id
-            ).first()
+            author = db.query(models.Author).filter(models.Author.id == book_data.author_id).first()
             if not author:
                 raise ValueError(f"Author with id {book_data.author_id} not found")
-
-            # Validace kategorie
-            cat = db.query(models.Category).filter(
-                models.Category.id == book_data.category_id
-            ).first()
+            cat = db.query(models.Category).filter(models.Category.id == book_data.category_id).first()
             if not cat:
                 raise ValueError(f"Category with id {book_data.category_id} not found")
-
-            # Validace ISBN unikátnosti
-            if db.query(models.Book).filter(
-                models.Book.isbn == book_data.isbn
-            ).first():
+            if db.query(models.Book).filter(models.Book.isbn == book_data.isbn).first():
                 raise ValueError(f"Book with ISBN '{book_data.isbn}' already exists")
 
-            # Vytvoření
             book = models.Book(**book_data.model_dump())
             db.add(book)
-            db.flush()  # získáme ID bez commitu
+            db.flush()
             db.refresh(book)
-
-            results.append(schemas.BulkResultItem(
-                index=i, status="created", book=book,
-            ))
+            results.append(schemas.BulkResultItem(index=i, status="created", book=book))
             created_count += 1
-
         except (ValueError, Exception) as e:
-            results.append(schemas.BulkResultItem(
-                index=i, status="error", error=str(e),
-            ))
+            results.append(schemas.BulkResultItem(index=i, status="error", error=str(e)))
             failed_count += 1
 
     if created_count > 0:
-        db.commit()  # commit jen úspěšné
+        db.commit()
     else:
         db.rollback()
 
     return schemas.BulkCreateResponse(
-        total=len(data.books),
-        created=created_count,
-        failed=failed_count,
-        results=results,
+        total=len(data.books), created=created_count,
+        failed=failed_count, results=results,
     )
 
 
 # ── Clone Book ───────────────────────────────────────────
 
 def clone_book(db: Session, book_id: int, data: schemas.BookCloneRequest) -> models.Book:
-    source = get_book(db, book_id)  # 404 pokud neexistuje
-
-    # ISBN unikátnost
+    source = get_book(db, book_id)
     if db.query(models.Book).filter(models.Book.isbn == data.new_isbn).first():
-        raise HTTPException(
-            status_code=409,
-            detail=f"Book with ISBN '{data.new_isbn}' already exists",
-        )
-
+        raise HTTPException(status_code=409, detail=f"Book with ISBN '{data.new_isbn}' already exists")
     clone = models.Book(
         title=data.new_title or f"{source.title} (copy)",
-        isbn=data.new_isbn,
-        price=source.price,
-        published_year=source.published_year,
-        stock=data.stock,  # stock se NEKOPÍRUJE — explicitně nastavený nebo 0
-        author_id=source.author_id,
-        category_id=source.category_id,
+        isbn=data.new_isbn, price=source.price,
+        published_year=source.published_year, stock=data.stock,
+        author_id=source.author_id, category_id=source.category_id,
     )
     db.add(clone)
     db.commit()
@@ -576,15 +573,12 @@ def clone_book(db: Session, book_id: int, data: schemas.BookCloneRequest) -> mod
 
 def generate_invoice(db: Session, order_id: int) -> schemas.InvoiceResponse:
     order = get_order(db, order_id)
-
-    # Faktura jen pro potvrzené+ objednávky
     if order.status in ("pending", "cancelled"):
         raise HTTPException(
             status_code=403,
             detail=f"Cannot generate invoice for order in '{order.status}' state. "
                    f"Order must be confirmed, shipped, or delivered.",
         )
-
     items = []
     subtotal = 0.0
     for oi in order.items:
@@ -593,50 +587,32 @@ def generate_invoice(db: Session, order_id: int) -> schemas.InvoiceResponse:
         items.append(schemas.InvoiceItem(
             book_title=book.title if book else "Unknown",
             isbn=book.isbn if book else "N/A",
-            quantity=oi.quantity,
-            unit_price=oi.unit_price,
-            line_total=line_total,
+            quantity=oi.quantity, unit_price=oi.unit_price, line_total=line_total,
         ))
         subtotal += line_total
-
     return schemas.InvoiceResponse(
-        invoice_number=f"INV-{order.id:06d}",
-        order_id=order.id,
-        customer_name=order.customer_name,
-        customer_email=order.customer_email,
-        status=order.status,
-        issued_at=datetime.now(timezone.utc).isoformat(),
-        items=items,
-        subtotal=round(subtotal, 2),
-        item_count=len(items),
+        invoice_number=f"INV-{order.id:06d}", order_id=order.id,
+        customer_name=order.customer_name, customer_email=order.customer_email,
+        status=order.status, issued_at=datetime.now(timezone.utc).isoformat(),
+        items=items, subtotal=round(subtotal, 2), item_count=len(items),
     )
 
 
 # ── Add Item to Pending Order ────────────────────────────
 
-def add_item_to_order(
-    db: Session, order_id: int, data: schemas.OrderAddItem,
-) -> models.Order:
+def add_item_to_order(db: Session, order_id: int, data: schemas.OrderAddItem) -> models.Order:
     order = get_order(db, order_id)
-
-    # Jen pending objednávky lze modifikovat
     if order.status != "pending":
         raise HTTPException(
             status_code=403,
-            detail=f"Cannot modify order in '{order.status}' state. "
-                   f"Only pending orders can be modified.",
+            detail=f"Cannot modify order in '{order.status}' state. Only pending orders can be modified.",
         )
-
-    # Kontrola duplicitního book_id
     existing_book_ids = {oi.book_id for oi in order.items}
     if data.book_id in existing_book_ids:
         raise HTTPException(
             status_code=409,
-            detail=f"Book {data.book_id} is already in this order. "
-                   f"Use a separate order or modify the existing item.",
+            detail=f"Book {data.book_id} is already in this order.",
         )
-
-    # Validace knihy a skladu
     book = get_book(db, data.book_id)
     if book.stock < data.quantity:
         raise HTTPException(
@@ -644,17 +620,12 @@ def add_item_to_order(
             detail=f"Insufficient stock for book '{book.title}'. "
                    f"Available: {book.stock}, requested: {data.quantity}",
         )
-
-    # Přidání položky + odečtení skladu
     oi = models.OrderItem(
-        order_id=order.id,
-        book_id=data.book_id,
-        quantity=data.quantity,
-        unit_price=book.price,
+        order_id=order.id, book_id=data.book_id,
+        quantity=data.quantity, unit_price=book.price,
     )
     db.add(oi)
     book.stock -= data.quantity
-
     order.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(order)
@@ -664,46 +635,37 @@ def add_item_to_order(
 # ── Statistics ───────────────────────────────────────────
 
 def get_statistics(db: Session) -> schemas.StatisticsSummary:
-    total_books = db.query(models.Book).count()
-    total_orders = db.query(models.Order).count()
+    total_books = db.query(models.Book).filter(models.Book.is_deleted == False).count()
+    in_stock = db.query(models.Book).filter(
+        models.Book.stock > 0, models.Book.is_deleted == False,
+    ).count()
 
-    # Knihy na skladě vs vyprodané
-    in_stock = db.query(models.Book).filter(models.Book.stock > 0).count()
+    delivered = db.query(models.Order).filter(models.Order.status == "delivered").all()
+    revenue = sum(
+        sum(i.unit_price * i.quantity for i in order.items)
+        for order in delivered
+    )
 
-    # Celkový obrat (jen z delivered objednávek)
-    delivered = db.query(models.Order).filter(
-        models.Order.status == "delivered"
-    ).all()
-    revenue = 0.0
-    for order in delivered:
-        revenue += sum(i.unit_price * i.quantity for i in order.items)
-
-    # Průměrná cena knih
     avg_price = None
     if total_books > 0:
-        prices = [b.price for b in db.query(models.Book).all()]
+        prices = [b.price for b in db.query(models.Book).filter(models.Book.is_deleted == False).all()]
         avg_price = round(sum(prices) / len(prices), 2)
 
-    # Průměrné hodnocení
     avg_rating = None
     reviews = db.query(models.Review).all()
     if reviews:
         avg_rating = round(sum(r.rating for r in reviews) / len(reviews), 2)
 
-    # Objednávky dle stavu
     status_counts = {}
     for status in ["pending", "confirmed", "shipped", "delivered", "cancelled"]:
-        count = db.query(models.Order).filter(
-            models.Order.status == status
-        ).count()
-        status_counts[status] = count
+        status_counts[status] = db.query(models.Order).filter(models.Order.status == status).count()
 
     return schemas.StatisticsSummary(
         total_authors=db.query(models.Author).count(),
         total_categories=db.query(models.Category).count(),
         total_books=total_books,
         total_tags=db.query(models.Tag).count(),
-        total_orders=total_orders,
+        total_orders=db.query(models.Order).count(),
         total_reviews=len(reviews),
         books_in_stock=in_stock,
         books_out_of_stock=total_books - in_stock,

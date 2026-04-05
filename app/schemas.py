@@ -1,3 +1,4 @@
+
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime
@@ -23,6 +24,7 @@ class AuthorResponse(BaseModel):
     bio: Optional[str]
     born_year: Optional[int]
     created_at: datetime
+    updated_at: datetime
 
     class Config:
         from_attributes = True
@@ -44,12 +46,13 @@ class CategoryResponse(BaseModel):
     id: int
     name: str
     description: Optional[str]
+    updated_at: datetime
 
     class Config:
         from_attributes = True
 
 
-# ── Tags (před Books kvůli referenci v BookResponse) ─────
+# ── Tags ─────────────────────────────────────────────────
 
 class TagCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=30)
@@ -63,6 +66,7 @@ class TagResponse(BaseModel):
     id: int
     name: str
     created_at: datetime
+    updated_at: datetime
 
     class Config:
         from_attributes = True
@@ -104,6 +108,7 @@ class BookResponse(BaseModel):
     author_id: int
     category_id: int
     created_at: datetime
+    updated_at: datetime
     author: AuthorResponse
     category: CategoryResponse
     tags: List[TagResponse] = Field(default_factory=list)
@@ -249,7 +254,7 @@ class BulkBookCreate(BaseModel):
 
 class BulkResultItem(BaseModel):
     index: int
-    status: str  # "created" | "error"
+    status: str
     book: Optional[BookResponse] = None
     error: Optional[str] = None
 
@@ -313,3 +318,40 @@ class StatisticsSummary(BaseModel):
     average_book_price: Optional[float]
     average_rating: Optional[float]
     orders_by_status: dict
+
+
+# ── Cover Upload ─────────────────────────────────────────
+
+class CoverUploadResponse(BaseModel):
+    book_id: int
+    filename: str
+    content_type: str
+    size_bytes: int
+
+
+# ── Export Jobs ──────────────────────────────────────────
+
+class ExportJobCreated(BaseModel):
+    job_id: str
+    status: str
+    created_at: str
+
+
+class ExportJobResult(BaseModel):
+    job_id: str
+    status: str
+    created_at: str
+    completed_at: Optional[str] = None
+    total: Optional[int] = None
+    data: Optional[list] = None
+
+
+# ── Maintenance ──────────────────────────────────────────
+
+class MaintenanceToggle(BaseModel):
+    enabled: bool
+
+
+class MaintenanceStatus(BaseModel):
+    maintenance_mode: bool
+    message: str

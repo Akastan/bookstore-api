@@ -1,27 +1,146 @@
-from typing import Optional, List
 
-from fastapi import FastAPI, Depends, Query
+import os
+import time
+import uuid
+import datetime
+from typing import Optional, List
+from collections import defaultdict
+
+from fastapi import (
+    FastAPI, Depends, Query, Request, Response,
+    UploadFile, File, Security, HTTPException,
+)
+from fastapi.security import APIKeyHeader
+from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from .database import engine, get_db, Base
-from . import crud, schemas
-from . import models
+from . import crud, schemas, models
 
-from fastapi.responses import JSONResponse
-
-# Vytvoření tabulek při startu
 Base.metadata.create_all(bind=engine)
+
+# ── Configuration ────────────────────────────────────────
+
+API_KEY = os.getenv("API_KEY", "test-api-key")
+MAX_COVER_SIZE = 2 * 1024 * 1024  # 2 MB
+ALLOWED_COVER_TYPES = {"image/jpeg", "image/png"}
+
+# ── In-memory state (cleared on /reset) ─────────────────
+
+maintenance_mode = False
+cover_storage: dict[int, dict] = {}        # book_id -> {data, filename, content_type, size}
+export_jobs: dict[str, dict] = {}           # job_id -> {status, created_at, complete_after, data}
+rate_limit_store: defaultdict = defaultdict(list)  # key -> [timestamps]
+
+# Rate limits: (max_requests, window_seconds)
+RATE_LIMITS = {
+    "bulk": (3, 30),
+    "discount": (5, 10),
+}
+
+MAINTENANCE_EXEMPT = {"/health", "/admin/maintenance", "/openapi.json", "/docs", "/redoc"}
+
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def require_api_key(api_key: str = Security(api_key_header)):
+    if not api_key or api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return api_key
+
+
+# ── App ──────────────────────────────────────────────────
 
 app = FastAPI(
     title="Bookstore API",
-    description="REST API pro správu knihkupectví – knihy, autoři, kategorie, recenze, tagy a objednávky.",
-    version="3.0.2",
+    description=(
+        "REST API pro správu knihkupectví – knihy, autoři, kategorie, recenze, "
+        "tagy a objednávky.\n\n"
+        "**Autentizace:** Některé endpointy vyžadují hlavičku `X-API-Key`.\n\n"
+        "**Rate limiting:** Endpoint `/books/bulk` (3 req/30s) a `/books/{id}/discount` "
+        "(5 req/10s) mají rate limit. Při překročení vrací 429.\n\n"
+        "**Maintenance mode:** Při aktivním maintenance režimu vrací neadmin endpointy 503.\n\n"
+        "**Soft delete:** `DELETE /books/{id}` provede soft delete. "
+        "`GET /books/{id}` na smazanou knihu vrátí 410 Gone.\n\n"
+        "**ETags:** Detail endpointy vrací `ETag` header. `If-None-Match` → 304, "
+        "`If-Match` na PUT → 412 při neshodě.\n\n"
+        "**Nepoužívejte nepodporované HTTP metody** – vrací 405 Method Not Allowed."
+    ),
+    version="4.0.0",
 )
+
+
+# ── Middleware (registration order: last registered = first executed) ──
+
+def _get_rate_limit_key(method: str, path: str) -> Optional[str]:
+    if method == "POST" and path == "/books/bulk":
+        return "bulk"
+    if method == "POST" and "/discount" in path and path.startswith("/books/"):
+        return "discount"
+    return None
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    key = _get_rate_limit_key(request.method, request.url.path)
+    if key and key in RATE_LIMITS:
+        max_req, window = RATE_LIMITS[key]
+        client_ip = request.client.host if request.client else "unknown"
+        store_key = f"{client_ip}:{key}"
+        now = time.time()
+        rate_limit_store[store_key] = [t for t in rate_limit_store[store_key] if t > now - window]
+        if len(rate_limit_store[store_key]) >= max_req:
+            oldest = rate_limit_store[store_key][0]
+            retry_after = int(window - (now - oldest)) + 1
+            return JSONResponse(
+                status_code=429,
+                content={"detail": f"Rate limit exceeded for this endpoint. Try again later."},
+                headers={"Retry-After": str(retry_after)},
+            )
+        rate_limit_store[store_key].append(now)
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def maintenance_middleware(request: Request, call_next):
+    global maintenance_mode
+    if maintenance_mode and request.url.path not in MAINTENANCE_EXEMPT:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Service temporarily unavailable for maintenance"},
+            headers={"Retry-After": "300"},
+        )
+    return await call_next(request)
+
+
+# ── ETag helpers ─────────────────────────────────────────
+
+def _check_etag_get(request: Request, response: Response, updated_at) -> Optional[Response]:
+    """For GET: set ETag, return 304 if If-None-Match matches."""
+    etag = crud.generate_etag(updated_at)
+    response.headers["ETag"] = f'"{etag}"'
+    if_none_match = request.headers.get("if-none-match")
+    if if_none_match and if_none_match.strip('"') == etag:
+        return Response(status_code=304, headers={"ETag": f'"{etag}"'})
+    return None
+
+
+def _check_etag_put(request: Request, updated_at):
+    """For PUT: check If-Match, raise 412 if mismatch."""
+    if_match = request.headers.get("if-match")
+    if if_match:
+        current_etag = crud.generate_etag(updated_at)
+        if if_match.strip('"') != current_etag:
+            raise HTTPException(
+                status_code=412,
+                detail="Precondition Failed: resource has been modified since last read",
+            )
 
 
 # ── Health ───────────────────────────────────────────────
 
-@app.get("/health", tags=["Health"])
+@app.get("/health", tags=["Health"],
+         responses={405: {"description": "Method Not Allowed"}})
 def health_check():
     return {"status": "ok"}
 
@@ -38,19 +157,38 @@ def list_authors(skip: int = 0, limit: int = 100, db: Session = Depends(get_db))
     return crud.get_authors(db, skip=skip, limit=limit)
 
 
-@app.get("/authors/{author_id}", response_model=schemas.AuthorResponse, tags=["Authors"])
-def get_author(author_id: int, db: Session = Depends(get_db)):
-    return crud.get_author(db, author_id)
+@app.get("/authors/{author_id}", response_model=schemas.AuthorResponse, tags=["Authors"],
+         responses={304: {"description": "Not Modified"}, 404: {"description": "Author not found"}})
+def get_author(author_id: int, request: Request, response: Response, db: Session = Depends(get_db)):
+    author = crud.get_author(db, author_id)
+    cached = _check_etag_get(request, response, author.updated_at)
+    if cached:
+        return cached
+    return author
 
 
-@app.put("/authors/{author_id}", response_model=schemas.AuthorResponse, tags=["Authors"])
-def update_author(author_id: int, author: schemas.AuthorUpdate, db: Session = Depends(get_db)):
+@app.put("/authors/{author_id}", response_model=schemas.AuthorResponse, tags=["Authors"],
+         responses={412: {"description": "Precondition Failed – ETag mismatch"}})
+def update_author(author_id: int, author: schemas.AuthorUpdate,
+                  request: Request, db: Session = Depends(get_db)):
+    existing = crud.get_author(db, author_id)
+    _check_etag_put(request, existing.updated_at)
     return crud.update_author(db, author_id, author)
 
 
 @app.delete("/authors/{author_id}", status_code=204, tags=["Authors"])
 def delete_author(author_id: int, db: Session = Depends(get_db)):
     crud.delete_author(db, author_id)
+
+
+@app.get("/authors/{author_id}/books", response_model=schemas.PaginatedBooks, tags=["Authors"])
+def list_author_books(
+    author_id: int,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    return crud.get_author_books(db, author_id, page=page, page_size=page_size)
 
 
 # ── Categories ───────────────────────────────────────────
@@ -65,13 +203,22 @@ def list_categories(db: Session = Depends(get_db)):
     return crud.get_categories(db)
 
 
-@app.get("/categories/{category_id}", response_model=schemas.CategoryResponse, tags=["Categories"])
-def get_category(category_id: int, db: Session = Depends(get_db)):
-    return crud.get_category(db, category_id)
+@app.get("/categories/{category_id}", response_model=schemas.CategoryResponse, tags=["Categories"],
+         responses={304: {"description": "Not Modified"}})
+def get_category(category_id: int, request: Request, response: Response, db: Session = Depends(get_db)):
+    cat = crud.get_category(db, category_id)
+    cached = _check_etag_get(request, response, cat.updated_at)
+    if cached:
+        return cached
+    return cat
 
 
-@app.put("/categories/{category_id}", response_model=schemas.CategoryResponse, tags=["Categories"])
-def update_category(category_id: int, category: schemas.CategoryUpdate, db: Session = Depends(get_db)):
+@app.put("/categories/{category_id}", response_model=schemas.CategoryResponse, tags=["Categories"],
+         responses={412: {"description": "Precondition Failed – ETag mismatch"}})
+def update_category(category_id: int, category: schemas.CategoryUpdate,
+                    request: Request, db: Session = Depends(get_db)):
+    existing = crud.get_category(db, category_id)
+    _check_etag_put(request, existing.updated_at)
     return crud.update_category(db, category_id, category)
 
 
@@ -105,24 +252,44 @@ def list_books(
     )
 
 
-@app.get("/books/{book_id}", response_model=schemas.BookResponse, tags=["Books"])
-def get_book(book_id: int, db: Session = Depends(get_db)):
-    return crud.get_book(db, book_id)
+@app.get("/books/{book_id}", response_model=schemas.BookResponse, tags=["Books"],
+         responses={304: {"description": "Not Modified"}, 410: {"description": "Book has been deleted (soft delete)"}})
+def get_book(book_id: int, request: Request, response: Response, db: Session = Depends(get_db)):
+    book = crud.get_book(db, book_id)
+    cached = _check_etag_get(request, response, book.updated_at)
+    if cached:
+        return cached
+    return book
 
 
-@app.put("/books/{book_id}", response_model=schemas.BookResponse, tags=["Books"])
-def update_book(book_id: int, book: schemas.BookUpdate, db: Session = Depends(get_db)):
+@app.put("/books/{book_id}", response_model=schemas.BookResponse, tags=["Books"],
+         responses={412: {"description": "Precondition Failed – ETag mismatch"},
+                    410: {"description": "Book has been deleted"}})
+def update_book(book_id: int, book: schemas.BookUpdate,
+                request: Request, db: Session = Depends(get_db)):
+    existing = crud.get_book(db, book_id)
+    _check_etag_put(request, existing.updated_at)
     return crud.update_book(db, book_id, book)
 
 
-@app.delete("/books/{book_id}", status_code=204, tags=["Books"])
+@app.delete("/books/{book_id}", status_code=204, tags=["Books"],
+            responses={410: {"description": "Book already deleted"}})
 def delete_book(book_id: int, db: Session = Depends(get_db)):
     crud.delete_book(db, book_id)
 
 
+@app.post("/books/{book_id}/restore", response_model=schemas.BookResponse, tags=["Books"],
+          responses={400: {"description": "Book is not deleted"}, 404: {"description": "Book not found"}})
+def restore_book(book_id: int, db: Session = Depends(get_db)):
+    """Restore a soft-deleted book."""
+    return crud.restore_book(db, book_id)
+
+
 # ── Reviews ──────────────────────────────────────────────
 
-@app.post("/books/{book_id}/reviews", response_model=schemas.ReviewResponse, status_code=201, tags=["Reviews"])
+@app.post("/books/{book_id}/reviews", response_model=schemas.ReviewResponse,
+          status_code=201, tags=["Reviews"],
+          responses={410: {"description": "Book has been deleted"}})
 def create_review(book_id: int, review: schemas.ReviewCreate, db: Session = Depends(get_db)):
     return crud.create_review(db, book_id, review)
 
@@ -139,7 +306,8 @@ def get_book_rating(book_id: int, db: Session = Depends(get_db)):
 
 # ── Discount ─────────────────────────────────────────────
 
-@app.post("/books/{book_id}/discount", response_model=schemas.DiscountResponse, tags=["Books"])
+@app.post("/books/{book_id}/discount", response_model=schemas.DiscountResponse, tags=["Books"],
+          responses={429: {"description": "Rate limit exceeded (5 req/10s)"}})
 def apply_discount(book_id: int, discount: schemas.DiscountRequest, db: Session = Depends(get_db)):
     return crud.apply_discount(db, book_id, discount)
 
@@ -149,6 +317,55 @@ def apply_discount(book_id: int, discount: schemas.DiscountRequest, db: Session 
 @app.patch("/books/{book_id}/stock", response_model=schemas.BookResponse, tags=["Books"])
 def update_stock(book_id: int, quantity: int = Query(...), db: Session = Depends(get_db)):
     return crud.update_stock(db, book_id, quantity)
+
+
+# ── Cover Upload ─────────────────────────────────────────
+
+@app.post("/books/{book_id}/cover", response_model=schemas.CoverUploadResponse, tags=["Books"],
+          responses={
+              413: {"description": "File too large (max 2 MB)"},
+              415: {"description": "Unsupported file type (only JPEG, PNG)"},
+              410: {"description": "Book has been deleted"},
+          })
+async def upload_cover(book_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    crud.get_book(db, book_id)
+    if file.content_type not in ALLOWED_COVER_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type: {file.content_type}. Allowed: image/jpeg, image/png",
+        )
+    data = await file.read()
+    if len(data) > MAX_COVER_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large: {len(data)} bytes. Maximum: {MAX_COVER_SIZE} bytes (2 MB)",
+        )
+    cover_storage[book_id] = {
+        "data": data, "filename": file.filename or "cover",
+        "content_type": file.content_type, "size": len(data),
+    }
+    return schemas.CoverUploadResponse(
+        book_id=book_id, filename=file.filename or "cover",
+        content_type=file.content_type, size_bytes=len(data),
+    )
+
+
+@app.get("/books/{book_id}/cover", tags=["Books"],
+         responses={404: {"description": "No cover uploaded"}, 410: {"description": "Book has been deleted"}})
+def get_cover(book_id: int, db: Session = Depends(get_db)):
+    crud.get_book(db, book_id)
+    if book_id not in cover_storage:
+        raise HTTPException(status_code=404, detail="No cover uploaded for this book")
+    c = cover_storage[book_id]
+    return Response(content=c["data"], media_type=c["content_type"])
+
+
+@app.delete("/books/{book_id}/cover", status_code=204, tags=["Books"])
+def delete_cover(book_id: int, db: Session = Depends(get_db)):
+    crud.get_book(db, book_id)
+    if book_id not in cover_storage:
+        raise HTTPException(status_code=404, detail="No cover uploaded for this book")
+    del cover_storage[book_id]
 
 
 # ── Tags ─────────────────────────────────────────────────
@@ -163,13 +380,22 @@ def list_tags(db: Session = Depends(get_db)):
     return crud.get_tags(db)
 
 
-@app.get("/tags/{tag_id}", response_model=schemas.TagResponse, tags=["Tags"])
-def get_tag(tag_id: int, db: Session = Depends(get_db)):
-    return crud.get_tag(db, tag_id)
+@app.get("/tags/{tag_id}", response_model=schemas.TagResponse, tags=["Tags"],
+         responses={304: {"description": "Not Modified"}})
+def get_tag(tag_id: int, request: Request, response: Response, db: Session = Depends(get_db)):
+    tag = crud.get_tag(db, tag_id)
+    cached = _check_etag_get(request, response, tag.updated_at)
+    if cached:
+        return cached
+    return tag
 
 
-@app.put("/tags/{tag_id}", response_model=schemas.TagResponse, tags=["Tags"])
-def update_tag(tag_id: int, tag: schemas.TagUpdate, db: Session = Depends(get_db)):
+@app.put("/tags/{tag_id}", response_model=schemas.TagResponse, tags=["Tags"],
+         responses={412: {"description": "Precondition Failed – ETag mismatch"}})
+def update_tag(tag_id: int, tag: schemas.TagUpdate,
+               request: Request, db: Session = Depends(get_db)):
+    existing = crud.get_tag(db, tag_id)
+    _check_etag_put(request, existing.updated_at)
     return crud.update_tag(db, tag_id, tag)
 
 
@@ -180,13 +406,11 @@ def delete_tag(tag_id: int, db: Session = Depends(get_db)):
 
 @app.post("/books/{book_id}/tags", response_model=schemas.BookResponse, tags=["Tags"])
 def add_tags_to_book(book_id: int, action: schemas.BookTagAction, db: Session = Depends(get_db)):
-    """Přidá tagy ke knize. Již existující vazby se ignorují."""
     return crud.add_tags_to_book(db, book_id, action.tag_ids)
 
 
 @app.delete("/books/{book_id}/tags", response_model=schemas.BookResponse, tags=["Tags"])
 def remove_tags_from_book(book_id: int, action: schemas.BookTagAction, db: Session = Depends(get_db)):
-    """Odebere tagy z knihy."""
     return crud.remove_tags_from_book(db, book_id, action.tag_ids)
 
 
@@ -194,7 +418,6 @@ def remove_tags_from_book(book_id: int, action: schemas.BookTagAction, db: Sessi
 
 @app.post("/orders", response_model=schemas.OrderResponse, status_code=201, tags=["Orders"])
 def create_order(order: schemas.OrderCreate, db: Session = Depends(get_db)):
-    """Vytvoří objednávku, odečte sklad a zachytí aktuální ceny."""
     o = crud.create_order(db, order)
     return crud.get_order_response(o)
 
@@ -219,65 +442,46 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
 
 @app.patch("/orders/{order_id}/status", response_model=schemas.OrderResponse, tags=["Orders"])
 def update_order_status(
-    order_id: int,
-    status_update: schemas.OrderStatusUpdate,
+    order_id: int, status_update: schemas.OrderStatusUpdate,
     db: Session = Depends(get_db),
 ):
-    """Změní stav objednávky dle povolených přechodů. Při zrušení vrátí sklad."""
     o = crud.update_order_status(db, order_id, status_update.status)
     return crud.get_order_response(o)
 
 
 @app.delete("/orders/{order_id}", status_code=204, tags=["Orders"])
 def delete_order(order_id: int, db: Session = Depends(get_db)):
-    """Smaže objednávku. Lze smazat pouze pending nebo cancelled objednávky."""
     crud.delete_order(db, order_id)
 
 
-# ── Reset (pro testovací framework) ──────────────────────
-
-@app.post("/reset", tags=["Testing"])
-def reset_database(db: Session = Depends(get_db)):
-    """Smaže všechna data z databáze. Pouze pro testovací účely."""
-    db.execute(models.Review.__table__.delete())
-    db.execute(models.OrderItem.__table__.delete())
-    db.execute(models.Order.__table__.delete())
-    db.execute(models.book_tags.delete())
-    db.execute(models.Book.__table__.delete())
-    db.execute(models.Tag.__table__.delete())
-    db.execute(models.Category.__table__.delete())
-    db.execute(models.Author.__table__.delete())
-    db.commit()
-    return {"status": "ok", "message": "Database reset complete"}
+@app.get("/orders/{order_id}/invoice", response_model=schemas.InvoiceResponse, tags=["Orders"])
+def get_invoice(order_id: int, db: Session = Depends(get_db)):
+    return crud.generate_invoice(db, order_id)
 
 
-# ── Author's Books ───────────────────────────────────────
-
-@app.get("/authors/{author_id}/books", response_model=schemas.PaginatedBooks,
-         tags=["Authors"])
-def list_author_books(
-    author_id: int,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1, le=100),
-    db: Session = Depends(get_db),
-):
-    """Seznam knih daného autora s stránkováním."""
-    return crud.get_author_books(db, author_id, page=page, page_size=page_size)
+@app.post("/orders/{order_id}/items", response_model=schemas.OrderResponse,
+          status_code=201, tags=["Orders"])
+def add_item_to_order(order_id: int, data: schemas.OrderAddItem, db: Session = Depends(get_db)):
+    order = crud.add_item_to_order(db, order_id, data)
+    return crud.get_order_response(order)
 
 
 # ── Bulk Create Books ────────────────────────────────────
 
-@app.post("/books/bulk", tags=["Books"])
+@app.post("/books/bulk", tags=["Books"],
+          responses={
+              201: {"description": "All books created"},
+              207: {"description": "Partial success"},
+              401: {"description": "Invalid or missing API key"},
+              422: {"description": "All books failed validation"},
+              429: {"description": "Rate limit exceeded (3 req/30s)"},
+          })
 def bulk_create_books(
-    data: schemas.BulkBookCreate, db: Session = Depends(get_db),
+    data: schemas.BulkBookCreate,
+    db: Session = Depends(get_db),
+    _: str = Depends(require_api_key),
 ):
-    """
-    Hromadné vytvoření knih. Každá kniha se validuje samostatně.
-    Vrací 201 pokud všechny uspěly, 207 pokud některé selhaly,
-    422 pokud všechny selhaly.
-    """
     result = crud.bulk_create_books(db, data)
-
     if result.failed == 0:
         return JSONResponse(status_code=201, content=result.model_dump())
     elif result.created == 0:
@@ -290,48 +494,143 @@ def bulk_create_books(
 
 @app.post("/books/{book_id}/clone", response_model=schemas.BookResponse,
           status_code=201, tags=["Books"])
-def clone_book(
-    book_id: int, data: schemas.BookCloneRequest,
-    db: Session = Depends(get_db),
-):
-    """Vytvoří kopii knihy s novým ISBN. Stock se nekopíruje."""
+def clone_book(book_id: int, data: schemas.BookCloneRequest, db: Session = Depends(get_db)):
     return crud.clone_book(db, book_id, data)
 
 
-# ── Invoice ──────────────────────────────────────────────
+# ── Async Exports ────────────────────────────────────────
 
-@app.get("/orders/{order_id}/invoice", response_model=schemas.InvoiceResponse,
-         tags=["Orders"])
-def get_invoice(order_id: int, db: Session = Depends(get_db)):
-    """
-    Vygeneruje fakturu pro objednávku.
-    Dostupné pouze pro objednávky ve stavu confirmed, shipped nebo delivered.
-    Pending a cancelled → 403.
-    """
-    return crud.generate_invoice(db, order_id)
-
-
-# ── Add Item to Order ────────────────────────────────────
-
-@app.post("/orders/{order_id}/items", response_model=schemas.OrderResponse,
-          status_code=201, tags=["Orders"])
-def add_item_to_order(
-    order_id: int, data: schemas.OrderAddItem,
-    db: Session = Depends(get_db),
-):
-    """
-    Přidá položku do existující objednávky.
-    Pouze pending objednávky lze modifikovat (jinak 403).
-    Duplicitní book_id v objednávce → 409.
-    """
-    order = crud.add_item_to_order(db, order_id, data)
-    return crud.get_order_response(order)
+@app.post("/exports/books", status_code=202, tags=["Exports"],
+          response_model=schemas.ExportJobCreated,
+          responses={401: {"description": "Invalid or missing API key"}})
+def create_book_export(db: Session = Depends(get_db), _: str = Depends(require_api_key)):
+    """Start async book export. Poll GET /exports/{job_id} for result."""
+    job_id = str(uuid.uuid4())
+    books = db.query(models.Book).filter(models.Book.is_deleted == False).all()
+    data = [
+        {"id": b.id, "title": b.title, "isbn": b.isbn, "price": b.price,
+         "stock": b.stock, "author_id": b.author_id, "category_id": b.category_id}
+        for b in books
+    ]
+    now = time.time()
+    export_jobs[job_id] = {
+        "status": "processing",
+        "created_at": datetime.now(datetime.timezone.utc).isoformat(),
+        "complete_after": now + 2,  # Simulated 2s processing
+        "data": data,
+        "total": len(data),
+    }
+    return schemas.ExportJobCreated(
+        job_id=job_id, status="processing",
+        created_at=export_jobs[job_id]["created_at"],
+    )
 
 
-# ── Statistics ───────────────────────────────────────────
+@app.post("/exports/orders", status_code=202, tags=["Exports"],
+          response_model=schemas.ExportJobCreated,
+          responses={401: {"description": "Invalid or missing API key"}})
+def create_order_export(db: Session = Depends(get_db), _: str = Depends(require_api_key)):
+    """Start async order export. Poll GET /exports/{job_id} for result."""
+    job_id = str(uuid.uuid4())
+    orders = db.query(models.Order).all()
+    data = [
+        {"id": o.id, "customer_name": o.customer_name, "status": o.status,
+         "total_price": round(sum(i.unit_price * i.quantity for i in o.items), 2),
+         "item_count": len(o.items), "created_at": o.created_at.isoformat()}
+        for o in orders
+    ]
+    now = time.time()
+    export_jobs[job_id] = {
+        "status": "processing",
+        "created_at": datetime.now(datetime.timezone.utc).isoformat(),
+        "complete_after": now + 2,
+        "data": data,
+        "total": len(data),
+    }
+    return schemas.ExportJobCreated(
+        job_id=job_id, status="processing",
+        created_at=export_jobs[job_id]["created_at"],
+    )
 
-@app.get("/statistics/summary", response_model=schemas.StatisticsSummary,
-         tags=["Statistics"])
-def get_statistics(db: Session = Depends(get_db)):
-    """Souhrnné statistiky knihkupectví. Obrat se počítá jen z delivered objednávek."""
+
+@app.get("/exports/{job_id}", tags=["Exports"],
+         responses={
+             200: {"description": "Export completed", "model": schemas.ExportJobResult},
+             202: {"description": "Export still processing"},
+             404: {"description": "Export job not found"},
+         })
+def get_export_job(job_id: str):
+    job = export_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Export job {job_id} not found")
+
+    if time.time() < job["complete_after"]:
+        return JSONResponse(
+            status_code=202,
+            content={"job_id": job_id, "status": "processing", "created_at": job["created_at"]},
+        )
+    return schemas.ExportJobResult(
+        job_id=job_id, status="completed", created_at=job["created_at"],
+        completed_at=datetime.now(datetime.timezone.utc).isoformat(),
+        total=job["total"], data=job["data"],
+    )
+
+
+# ── Admin ────────────────────────────────────────────────
+
+@app.post("/admin/maintenance", response_model=schemas.MaintenanceStatus, tags=["Admin"],
+          responses={401: {"description": "Invalid or missing API key"}})
+def toggle_maintenance(data: schemas.MaintenanceToggle, _: str = Depends(require_api_key)):
+    global maintenance_mode
+    maintenance_mode = data.enabled
+    msg = "Maintenance mode activated" if data.enabled else "Maintenance mode deactivated"
+    return schemas.MaintenanceStatus(maintenance_mode=maintenance_mode, message=msg)
+
+
+@app.get("/admin/maintenance", response_model=schemas.MaintenanceStatus, tags=["Admin"])
+def get_maintenance_status():
+    return schemas.MaintenanceStatus(
+        maintenance_mode=maintenance_mode,
+        message="Maintenance mode is active" if maintenance_mode else "System operational",
+    )
+
+
+# ── Statistics (protected) ───────────────────────────────
+
+@app.get("/statistics/summary", response_model=schemas.StatisticsSummary, tags=["Statistics"],
+         responses={401: {"description": "Invalid or missing API key"}})
+def get_statistics(db: Session = Depends(get_db), _: str = Depends(require_api_key)):
     return crud.get_statistics(db)
+
+
+# ── Deprecated Redirect ──────────────────────────────────
+
+@app.get("/catalog", tags=["Deprecated"],
+         responses={301: {"description": "Moved Permanently to /books"}},
+         status_code=301)
+def deprecated_catalog():
+    """Deprecated: use GET /books instead."""
+    return RedirectResponse(url="/books", status_code=301)
+
+
+# ── Reset ────────────────────────────────────────────────
+
+@app.post("/reset", tags=["Testing"])
+def reset_database(db: Session = Depends(get_db)):
+    """Reset all data (DB + in-memory state). For testing only."""
+    global maintenance_mode
+    db.execute(models.Review.__table__.delete())
+    db.execute(models.OrderItem.__table__.delete())
+    db.execute(models.Order.__table__.delete())
+    db.execute(models.book_tags.delete())
+    db.execute(models.Book.__table__.delete())
+    db.execute(models.Tag.__table__.delete())
+    db.execute(models.Category.__table__.delete())
+    db.execute(models.Author.__table__.delete())
+    db.commit()
+    # Clear in-memory state
+    maintenance_mode = False
+    cover_storage.clear()
+    export_jobs.clear()
+    rate_limit_store.clear()
+    return {"status": "ok", "message": "Database and state reset complete"}
