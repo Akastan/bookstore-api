@@ -1,11 +1,35 @@
-.venv/
+# Python
 __pycache__/
-*.pyc
-bookstore.db
-bookstore.db-wal
-bookstore.db-shm
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+venv/
+
+# SQLite database
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Coverage
 .coverage
-coverage.json
 htmlcov/
-*.egg-info/
+coverage_*.json
+
+# Pytest
 .pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Distribution
+*.egg-info/

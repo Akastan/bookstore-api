@@ -1,6 +1,6 @@
 # Bookstore API
 
-REST API pro správu knihkupectví. Slouží jako testovací aplikace pro [vibe-testing-framework](https://github.com/Akastan/vibe-testing-framework) - framework pro automatické generování API testů pomocí LLM.
+REST API pro správu knihkupectví. Slouží jako testovací aplikace pro [vibe-testing-framework](https://github.com/Akastan/vibe-testing-framework) — framework pro automatické generování API testů pomocí LLM.
 
 ## O projektu
 
@@ -13,12 +13,12 @@ CRUD aplikace postavená na FastAPI + SQLite se 40 endpointy a 10 různými HTTP
 - **Slevy** – aplikace slev s byznys pravidly (max 50 %, jen starší knihy)
 - **Správa skladu** – delta přičítání/odečítání přes query parametr, ochrana proti zápornému stavu
 - **Tagy** – many-to-many vazba na knihy, idempotentní přidávání, ochrana při mazání
-- **Objednávky** – stavový automat (pending -> confirmed -> shipped -> delivered / cancelled), zachycení cen, automatická správa skladu, přidávání položek, fakturace
+- **Objednávky** – stavový automat (pending → confirmed → shipped → delivered / cancelled), zachycení cen, automatická správa skladu, přidávání položek, fakturace
 - **Statistiky** – agregované metriky (obrat, průměrné hodnocení, stav skladu)
 
 ## Technologie
 
-- **Python 3.12** · **FastAPI** · **SQLAlchemy** · **SQLite** (WAL mode) · **Pydantic v2** · **Docker**
+**Python 3.12** · **FastAPI** · **SQLAlchemy** · **SQLite** (WAL mode) · **Pydantic v2** · **Docker**
 
 ## Spuštění
 
@@ -135,17 +135,17 @@ pytest tests/test_existing.py -v
 
 ### Status kódy (10)
 
-| Kód | Význam                                            |
-|-----|---------------------------------------------------|
-| 200 | Úspěšný GET / PUT / PATCH                         |
-| 201 | Úspěšné vytvoření                                 |
-| 204 | Úspěšné smazání (prázdné tělo)                    |
-| 207 | Multi-Status - hromadné operace s partial success |
-| 400 | Porušení byznys pravidla                          |
-| 403 | Operace nedostupná v aktuálním stavu              |
-| 404 | Entita nenalezena                                 |
-| 409 | Konflikt (duplicita, závislosti)                  |
-| 422 | Nevalidní vstupní data (Pydantic)                 |
+| Kód | Význam |
+|-----|--------|
+| 200 | Úspěšný GET / PUT / PATCH |
+| 201 | Úspěšné vytvoření |
+| 204 | Úspěšné smazání (prázdné tělo) |
+| 207 | Multi-Status — hromadné operace s partial success |
+| 400 | Porušení byznys pravidla |
+| 403 | Operace nedostupná v aktuálním stavu |
+| 404 | Entita nenalezena |
+| 409 | Konflikt (duplicita, závislosti) |
+| 422 | Nevalidní vstupní data (Pydantic) |
 
 ## Stavový automat objednávek
 
@@ -173,20 +173,21 @@ bookstore-api/
 ├── Dockerfile
 ├── docker-compose.yml
 ├── db_schema.sql        # SQL schéma export
-├── export_inputs.py     # Export dat pro vibe-testing-framework
 ├── requirements.txt
 └── readme.md
 ```
 
 ## Export pro Vibe Testing Framework
 
+Export vstupních dat se provádí centrálně z [vibe-testing-framework](https://github.com/Akastan/vibe-testing-framework):
+
 ```bash
-# Server musí běžet
-python export_inputs.py
+# V adresáři vibe-testing-framework (bookstore musí běžet na :8000):
+python export_inputs.py bookstore
 ```
 
-Exportuje OpenAPI spec, dokumentaci, zdrojový kód, DB schéma a existující testy do `../vibe-testing-framework/inputs/`.
+Exportuje OpenAPI spec, dokumentaci, zdrojový kód, DB schéma a existující testy do `inputs/api1_bookstore/`.
 
 ## Licence
 
-Projekt pro diplomovou práci - Vibe Testing: využití vibe codingu pro automatizované generování testů softwaru.
+Projekt pro diplomovou práci — Vibe Testing: využití vibe codingu pro automatizované generování testů softwaru.
