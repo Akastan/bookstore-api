@@ -483,11 +483,11 @@ def bulk_create_books(
 ):
     result = crud.bulk_create_books(db, data)
     if result.failed == 0:
-        return JSONResponse(status_code=201, content=result.model_dump())
+        return JSONResponse(status_code=201, content=result.model_dump(mode="json"))
     elif result.created == 0:
-        return JSONResponse(status_code=422, content=result.model_dump())
+        return JSONResponse(status_code=422, content=result.model_dump(mode="json"))
     else:
-        return JSONResponse(status_code=207, content=result.model_dump())
+        return JSONResponse(status_code=207, content=result.model_dump(mode="json"))
 
 
 # ── Clone Book ───────────────────────────────────────────
