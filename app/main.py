@@ -2,7 +2,7 @@
 import os
 import time
 import uuid
-import datetime
+from datetime import datetime, timezone
 from typing import Optional, List
 from collections import defaultdict
 
@@ -515,7 +515,7 @@ def create_book_export(db: Session = Depends(get_db), _: str = Depends(require_a
     now = time.time()
     export_jobs[job_id] = {
         "status": "processing",
-        "created_at": datetime.now(datetime.timezone.utc).isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "complete_after": now + 2,  # Simulated 2s processing
         "data": data,
         "total": len(data),
@@ -542,7 +542,7 @@ def create_order_export(db: Session = Depends(get_db), _: str = Depends(require_
     now = time.time()
     export_jobs[job_id] = {
         "status": "processing",
-        "created_at": datetime.now(datetime.timezone.utc).isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "complete_after": now + 2,
         "data": data,
         "total": len(data),
@@ -571,7 +571,7 @@ def get_export_job(job_id: str):
         )
     return schemas.ExportJobResult(
         job_id=job_id, status="completed", created_at=job["created_at"],
-        completed_at=datetime.now(datetime.timezone.utc).isoformat(),
+        completed_at=datetime.now(timezone.utc).isoformat(),
         total=job["total"], data=job["data"],
     )
 
